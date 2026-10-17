@@ -162,7 +162,7 @@ func (s *Scanner) Sweep(ctx context.Context, clusters []ClusterSpec, opts SweepO
 			continue
 		}
 
-		complete := true
+		sweep.Complete = true
 
 		// A mesh allowlist target can also be kubernetes.io/tls-typed (e.g.
 		// linkerd-identity-issuer), so it is reachable by both passes below.
@@ -190,11 +190,11 @@ func (s *Scanner) Sweep(ctx context.Context, clusters []ClusterSpec, opts SweepO
 				ok, err := api.listTLSSecrets(ctx, ns, visit)
 				if err != nil {
 					s.logger.Warn("kubernetes scan: list failed", "cluster", spec.Name, "namespace", ns, "error", err)
-					complete = false
+					sweep.Complete = false
 					setReason(&sweep, classifyError(err))
 					continue
 				}
-				complete = complete && ok
+				sweep.Complete = sweep.Complete && ok
 				if !ok {
 					setReason(&sweep, commonsentinel.KubernetesReasonTruncated)
 				}
@@ -206,17 +206,17 @@ func (s *Scanner) Sweep(ctx context.Context, clusters []ClusterSpec, opts SweepO
 			ok, err := api.listTLSSecrets(ctx, "", visit)
 			if err != nil {
 				s.logger.Warn("kubernetes scan: cluster-wide list failed", "cluster", spec.Name, "error", err)
-				complete = false
+				sweep.Complete = false
 				setReason(&sweep, classifyError(err))
 			} else {
-				complete = complete && ok
+				sweep.Complete = sweep.Complete && ok
 				if !ok {
 					setReason(&sweep, commonsentinel.KubernetesReasonTruncated)
 				}
 			}
 		}
 		if capped {
-			complete = false
+			sweep.Complete = false
 			setReason(&sweep, commonsentinel.KubernetesReasonTruncated)
 		}
 
@@ -232,7 +232,7 @@ func (s *Scanner) Sweep(ctx context.Context, clusters []ClusterSpec, opts SweepO
 					got, found, err := api.getSecret(ctx, target.Namespace, target.Name)
 					if err != nil {
 						s.logger.Warn("kubernetes scan: allowlist get failed", "cluster", spec.Name, "name", target.Name, "error", err)
-						complete = false
+						sweep.Complete = false
 						setReason(&sweep, classifyError(err))
 						continue
 					}
@@ -244,7 +244,7 @@ func (s *Scanner) Sweep(ctx context.Context, clusters []ClusterSpec, opts SweepO
 					got, found, err := api.getConfigMap(ctx, target.Namespace, target.Name)
 					if err != nil {
 						s.logger.Warn("kubernetes scan: allowlist get failed", "cluster", spec.Name, "name", target.Name, "error", err)
-						complete = false
+						sweep.Complete = false
 						setReason(&sweep, classifyError(err))
 						continue
 					}
@@ -254,7 +254,7 @@ func (s *Scanner) Sweep(ctx context.Context, clusters []ClusterSpec, opts SweepO
 					obj = configMapAsSecret(got)
 				}
 				if !s.collect(res, seen, collectedKeys, spec.Name, target.Kind, obj, target.Keys, &sweep) {
-					complete, capped = false, true
+					sweep.Complete, capped = false, true
 					setReason(&sweep, commonsentinel.KubernetesReasonTruncated)
 					break
 				}
@@ -262,14 +262,13 @@ func (s *Scanner) Sweep(ctx context.Context, clusters []ClusterSpec, opts SweepO
 		}
 
 		if ctx.Err() != nil {
-			complete = false
+			sweep.Complete = false
 			setReason(&sweep, commonsentinel.KubernetesReasonTimeout)
 		}
-		sweep.Complete = complete
 		sort.Strings(sweep.ObservedKeys) // deterministic output
 		res.Sweeps = append(res.Sweeps, sweep)
 	}
-	res.Truncated = capped
+	res.Truncated = res.Truncated || capped
 	return res
 }
 
@@ -295,7 +294,13 @@ func (s *Scanner) collect(res *SweepResult, seen, collectedKeys map[string]bool,
 	}
 
 	perKey := map[string][]string{} // data key -> fingerprints in file order
-	for _, ec := range extractPublicMaterial(obj.Data, allowedKeys) {
+	certs, truncated := extractPublicMaterial(obj.Data, allowedKeys)
+	if truncated {
+		res.Truncated = true
+		sweep.Complete = false
+		setReason(sweep, commonsentinel.KubernetesReasonTruncated)
+	}
+	for _, ec := range certs {
 		fp := fingerprintHex(ec.der)
 		if !seen[fp] {
 			if len(res.Certificates) >= maxCertsPerSweep || res.derBytes+len(ec.der) > maxCertBytesPerSweep {

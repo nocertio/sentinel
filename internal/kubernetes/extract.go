@@ -36,21 +36,26 @@ type extractedCert struct {
 // never copied, logged, or buffered. Extraction is structural (PEM
 // CERTIFICATE blocks, or a raw DER SEQUENCE tag) - never parsed: the backend
 // sandboxed parser is the sole X.509 parser, as everywhere in this agent.
-func extractPublicMaterial(data map[string][]byte, allowedKeys []string) []extractedCert {
+// The second result reports certificate material omitted by an extraction cap.
+func extractPublicMaterial(data map[string][]byte, allowedKeys []string) ([]extractedCert, bool) {
 	var out []extractedCert
+	var truncated bool
 	for _, key := range allowedKeys {
 		value, ok := data[key]
 		if !ok {
 			continue
 		}
-		for _, der := range certDERBlocks(value) {
+		ders, capped := certDERBlocks(value)
+		truncated = truncated || capped
+		for _, der := range ders {
 			if len(der) > maxDERBytes {
+				truncated = true
 				continue
 			}
 			out = append(out, extractedCert{dataKey: key, der: der})
 		}
 	}
-	return out
+	return out, truncated
 }
 
 // certDERBlocks mirrors filesystem.extractCertDER (kept in step with it,
@@ -59,16 +64,21 @@ func extractPublicMaterial(data map[string][]byte, allowedKeys []string) []extra
 // candidate through the structural gate so that a private key mislabelled
 // under tls.crt/ca.crt (as a CERTIFICATE PEM block or raw key DER) is never
 // shipped. Parsing itself stays with the backend's parser sandbox.
-func certDERBlocks(data []byte) [][]byte {
+func certDERBlocks(data []byte) ([][]byte, bool) {
 	var candidates [][]byte
+	var truncated bool
 	rest := data
-	for len(rest) > 0 && len(candidates) < maxCertsPerValue {
+	for len(rest) > 0 {
 		var block *pem.Block
 		block, rest = pem.Decode(rest)
 		if block == nil {
 			break
 		}
 		if block.Type == "CERTIFICATE" {
+			if len(candidates) == maxCertsPerValue {
+				truncated = true
+				break
+			}
 			candidates = append(candidates, block.Bytes)
 		}
 	}
@@ -81,5 +91,5 @@ func certDERBlocks(data []byte) [][]byte {
 			ders = append(ders, der)
 		}
 	}
-	return ders
+	return ders, truncated
 }

@@ -11,6 +11,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -19,6 +20,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -698,6 +700,58 @@ func TestKubernetesScanWithoutClustersReportsCompleted(t *testing.T) {
 
 	require.NoError(t, s.dispatchTask(context.Background(), task))
 	require.Equal(t, []string{commonsentinel.ReportStatusCompleted}, rec.statuses)
+}
+
+func TestKubernetesScanReportsExtractionTruncation(t *testing.T) {
+	for _, count := range []int{16, 17} {
+		t.Run(strconv.Itoa(count), func(t *testing.T) {
+			var chain []byte
+			api := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/api/v1/secrets" {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{map[string]any{
+					"metadata": map[string]string{"namespace": "default", "name": "web-tls"},
+					"type":     "kubernetes.io/tls",
+					"data":     map[string][]byte{"tls.crt": chain, "tls.key": []byte("never reported")},
+				}}})
+			}))
+			defer api.Close()
+			certificate := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: api.Certificate().Raw})
+			chain = bytes.Repeat(certificate, count)
+			dir := t.TempDir()
+			caFile, tokenFile := filepath.Join(dir, "ca.pem"), filepath.Join(dir, "token")
+			require.NoError(t, os.WriteFile(caFile, certificate, 0o600))
+			require.NoError(t, os.WriteFile(tokenFile, []byte("test-token"), 0o600))
+
+			rec := &reportRecorder{accept: true}
+			s := newTestSentinelWithClient(t, rec.server(t), true)
+			s.cfg.AllowKubernetesScan = boolPtr(true)
+			s.cfg.KubernetesClusters = []config.KubernetesCluster{{
+				Name: "cluster", Server: api.URL, CAFile: caFile, TokenFile: tokenFile,
+			}}
+			s.kubeScanner = kubernetes.NewScanner(s.logger)
+			require.NoError(t, s.runKubernetesScan(context.Background(), transport.TaskResponse{ID: "task-kubernetes", Type: commonsentinel.TaskTypeKubernetesScan}))
+
+			require.Len(t, rec.reports, 1)
+			report := rec.reports[0]
+			assert.Equal(t, commonsentinel.ReportStatusCompleted, report.Status)
+			require.Len(t, report.KubernetesSweeps, 1)
+			sweep := report.KubernetesSweeps[0]
+			assert.Equal(t, count == 16, sweep.Complete)
+			if count > 16 {
+				assert.Equal(t, commonsentinel.KubernetesReasonTruncated, sweep.Reason)
+			} else {
+				assert.Empty(t, sweep.Reason)
+			}
+			assert.Equal(t, []string{"secret/default/web-tls/tls.crt"}, sweep.ObservedKeys)
+			require.Len(t, report.KubernetesObservations, 1)
+			assert.Len(t, report.KubernetesObservations[0].ObservedChainFingerprints, 16)
+			require.Len(t, report.Certificates, 1)
+			assert.Equal(t, api.Certificate().Raw, report.Certificates[0].DER)
+		})
+	}
 }
 
 // TestRun_ServiceModeSelfEnrollsOnceThenReuses guards the idempotent

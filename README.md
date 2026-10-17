@@ -1,69 +1,23 @@
 # NoCert Sentinel
 
-NoCert Sentinel discovers deployed TLS certificates on your networks, Linux
-hosts and Kubernetes clusters, and reports observations to [NoCert](https://nocert.io).
-It observes certificates; it does not issue or renew them.
+Sentinel collects TLS certificates from private networks, Linux hosts and
+Kubernetes clusters for [NoCert](https://nocert.io). It records where each
+certificate is deployed so you can track it alongside your public-facing services.
 
-The agent currently requires a NoCert account. There is no standalone scan
-command. Source code is licensed under Apache-2.0; the vendored shared library
-uses MIT. See [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).
+It collects certificates from:
 
-## What leaves your environment
+- **Network endpoints:** TLS connections to the IP ranges and ports you configure.
+- **Linux hosts:** local listeners and certificate files the service can read.
+- **Kubernetes:** certificate fields in supported Secrets and ConfigMaps.
 
-| Source | Data sent to NoCert |
-| --- | --- |
-| Enrollment | Public signing key, hostname, OS, architecture, agent version, local IP address and interface subnets. |
-| Network and local listeners | Certificate DER bytes and SHA-256 fingerprints, endpoint IP/port/SNI, observed TLS versions, cipher suites, negotiated group, OCSP stapling and HSTS observations when available. |
-| Filesystem | Certificate DER bytes, fingerprints, certificate file paths and a warning when a nearby private-key file has overly broad permissions. The private-key path is not reported. |
-| Kubernetes | Certificate DER bytes, fingerprints, configured cluster name, namespace, object name/kind, certificate data-key name and cert-manager attribution when present. |
-| Task completion | Task identity/status and completeness information used to reconcile certificates and locations that disappeared. |
-
-These observations can reveal internal hostnames, addresses and application
-names. Review your scan scope and access permissions before enabling collection.
-
-The agent does not upload private keys, enrollment credentials after enrollment,
-Kubernetes credentials, complete configuration files or arbitrary Secret data.
-The Kubernetes API returns complete Secret objects to the agent, including
-private-key fields in memory; only allowlisted certificate fields are extracted
-for reporting. Kubernetes RBAC cannot restrict Secret reads to `tls.crt`.
-
-## Architecture and security
-
-```mermaid
-flowchart LR
-    subgraph Local[Your environment]
-        Network[TLS endpoints]
-        Files[Certificate files]
-        Kubernetes[Kubernetes API]
-        Agent[Sentinel]
-        Agent -->|TLS probes| Network
-        Agent -->|Read accessible files| Files
-        Agent -->|Read certificate objects| Kubernetes
-    end
-    Agent -->|Outbound HTTPS: poll tasks and report observations| Cloud[NoCert]
-```
-
-No inbound listener or firewall opening is required. The agent makes outbound
-connections to the backend and to the configured scan targets. The backend
-queues work; local switches can forbid each scan type.
-
-Enrollment uses an organization enrollment token over HTTPS. The agent generates
-its Ed25519 key locally and sends only the public key. Subsequent backend
-requests carry RFC 9421 HTTP Message Signatures; responses are verified against
-the server key pinned at enrollment. The local signing key is stored with mode
-`0600`. By default the agent checks rotation every six hours and rotates when
-less than five days remain, signing the rotation request with its current key.
-
-The Debian service runs as an unprivileged user with systemd restrictions and
-no Linux capabilities. It can only discover files accessible to that user.
-The agent is not a security boundary against an administrator who can modify it.
-Only scan systems you are authorized to inspect.
+Sentinel requires a NoCert account. Scan jobs come from NoCert; there is no
+standalone scan command. It does not issue or renew certificates.
 
 ## Install
 
-Supported packages: Debian/Ubuntu on **Linux amd64 and arm64**, using systemd.
-Windows and macOS are not currently supported. Other Linux distributions need
-their own service integration; no RPM is currently distributed.
+Packages are available for **Debian and Ubuntu, amd64 and arm64**, with systemd.
+
+Add the repository signing key:
 
 ```sh
 sudo apt update
@@ -74,13 +28,10 @@ sudo chmod a+r /etc/apt/keyrings/nocert.asc
 gpg --show-keys --fingerprint /etc/apt/keyrings/nocert.asc
 ```
 
-Check the fingerprint against the [source distribution page](https://nocert.io/sentinel-source):
+The fingerprint is `D5EF CB2E 291B 386D 5161 8CB3 E1DF FDD9 DF7B BB21`.
+You can also check it on the [source distribution page](https://nocert.io/sentinel-source).
 
-```text
-D5EF CB2E 291B 386D 5161 8CB3 E1DF FDD9 DF7B BB21
-```
-
-Then configure the repository:
+Add the APT source and install:
 
 ```sh
 sudo tee /etc/apt/sources.list.d/nocert.sources >/dev/null <<'EOF'
@@ -95,26 +46,29 @@ sudo apt update
 sudo apt install nocert-sentinel
 ```
 
-In NoCert, open **Sentinels > Deploy Sentinel** and follow the enrollment
-instructions. Prefer a root-managed `/etc/nocert-sentinel/enroll.env` file with
-mode `0600` containing `NOCERT_ENROLL_TOKEN=...`, then start the service:
+In NoCert, open **Sentinels > Deploy Sentinel** to get an enrollment token.
+Create `/etc/nocert-sentinel/enroll.env` as root with mode `0600`, containing:
+
+```text
+NOCERT_ENROLL_TOKEN=your-enrollment-token
+```
+
+Then start the service:
 
 ```sh
 sudo systemctl start nocert-sentinel
-sudo systemctl status nocert-sentinel
 sudo journalctl -u nocert-sentinel -f
 ```
 
-The `--enroll-token` flag is also available, but exposes the token in process
-arguments while it runs and forces a new identity. See
-[enrollment and fleet deployment](https://docs.nocert.io/sentinels/enrollment).
+The host will appear in your Sentinel inventory. See the
+[enrollment guide](https://docs.nocert.io/sentinels/enrollment) for fleet deployment
+and token handling. Avoid passing the token on the command line, where it can
+appear in process arguments.
 
-## Configuration and proxies
+## Configure collection
 
-The configuration is `/etc/nocert-sentinel/config.yaml`. See the
-[example](configs/config.example.yaml) and
-[configuration reference](https://docs.nocert.io/sentinels/configuration).
-Unknown YAML keys fail startup, so a misspelled scan restriction is not ignored.
+Configuration lives in `/etc/nocert-sentinel/config.yaml`. Each scan type can be
+disabled locally, even if NoCert requests it:
 
 ```yaml
 server_url: "https://sentinel.nocert.io"
@@ -125,9 +79,17 @@ allow_kubernetes_scan: false
 log_level: info
 ```
 
-The backend connection uses `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY` through
-Go's standard proxy support. Configure the environment of the service, not just
-your interactive shell. For example, `sudo systemctl edit nocert-sentinel`:
+Restart the service after changing the file. Unknown configuration keys cause
+startup to fail. The [example configuration](configs/config.example.yaml) and
+[configuration reference](https://docs.nocert.io/sentinels/configuration) cover
+the remaining settings.
+
+For Kubernetes, follow the [setup guide](https://docs.nocert.io/sentinels/kubernetes)
+and [example RBAC](configs/kubernetes-rbac.yaml). Sentinel can connect from a Linux
+host outside the cluster. Grant access only to the namespaces you intend to scan.
+
+If your host uses an outbound proxy, configure it in the service environment
+with `sudo systemctl edit nocert-sentinel`:
 
 ```ini
 [Service]
@@ -135,29 +97,30 @@ Environment="HTTPS_PROXY=http://proxy.example.com:3128"
 Environment="NO_PROXY=localhost,127.0.0.1"
 ```
 
-Restart the service after changing configuration. TLS certificate verification
-stays enabled; an intercepting proxy needs a trusted corporate CA on the host.
-Network probes connect directly to scan targets; the backend proxy setting does
-not turn them into HTTP proxy requests. Configure APT's proxy separately.
+Restart the service to apply it. A proxy that intercepts HTTPS needs its CA in
+the host trust store. Proxy settings apply to the connection to NoCert; TLS
+probes connect directly to scan targets. APT has its own proxy configuration.
 
-## Kubernetes and containers
+## Data and permissions
 
-The Sentinel can read clusters from an ordinary Linux host; it does not need to
-run inside a cluster. See [Kubernetes setup](https://docs.nocert.io/sentinels/kubernetes)
-and [example RBAC](configs/kubernetes-rbac.yaml). Prefer namespace-scoped grants
-and matching namespace filters. Kubeconfig exec plugins are rejected.
+Sentinel sends certificate bytes and deployment locations to NoCert. Depending
+on the source, locations include IP addresses, file paths, namespaces and object
+names. These observations can contain internal hostnames and application names.
 
-The included [Dockerfile](Dockerfile) is a source-build option for network and
-Kubernetes collection. It does not expose host files or host listeners. Disable
-filesystem and local scans in its configuration. No prebuilt container image or
-Helm chart is currently published. See [container instructions](docs/container.md).
+Private keys and Kubernetes credentials are not uploaded. Reading a Kubernetes
+Secret does expose the complete object to the local agent; Kubernetes RBAC
+cannot grant access to just its certificate fields. See
+[data collection and security](docs/data-collection.md) for the fields reported
+and how connections are authenticated.
 
-## Build, test and reproduce
+The Debian service runs as an unprivileged user with systemd restrictions. It
+needs outbound access to NoCert and the scan targets, with no inbound listener.
+Filesystem discovery is limited to files that this service user can read.
 
-Use Go **1.27.2**. The repository includes the dependency sources under `vendor/`,
-including only the shared-library packages this agent needs. There is no need
-for access to another repository. Always use `-mod=vendor`; no sibling checkout
-or module replacement is required.
+## Build from source
+
+Use Go **1.27.2**. Dependencies are included in `vendor/`; building this checkout
+does not require access to another repository.
 
 ```sh
 GOTOOLCHAIN=go1.27.2 go test -mod=vendor -race ./...
@@ -168,24 +131,21 @@ GOTOOLCHAIN=go1.27.2 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
   -o nocert-sentinel ./cmd/nocert-sentinel
 ```
 
-Replace `VERSION` with the release version and select the matching architecture.
-Reproducibility refers to the agent binary, not the complete Debian package or
-container image. For an existing release, use its signed source archive from
-[the source distribution page](https://nocert.io/sentinel-source), the same exact
-Go compiler and the same flags. Extract the corresponding `.deb` with
-`dpkg-deb -x package.deb pkg` and compare the two binaries with `sha256sum`.
+Replace `VERSION` with the release version; use `GOARCH=arm64` for ARM64.
+To reproduce a distributed binary, start from that release's signed source
+archive and use the same compiler and flags. See [release verification](docs/releases.md).
+GitHub workflow artifacts are unsigned build candidates, not official releases.
 
-Release builds generate SPDX SBOMs and a `checksums.txt` covering the source,
-packages, binary archives and SBOMs. Operator-signed releases use the fingerprint
-above. Verify `checksums.txt.asc` with GPG before running `sha256sum -c checksums.txt`.
-Artifacts from the manual GitHub prerelease build are unsigned review candidates,
-not trusted releases. See [release verification](docs/releases.md).
+The [Dockerfile](Dockerfile) supports source builds for network and Kubernetes
+collection. Follow the [container instructions](docs/container.md) for its scope
+and required mounts. No prebuilt image or Helm chart is published. Windows and
+macOS are not supported.
 
-## Contribute or report a problem
+## Contributing
 
-Issues and pull requests are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md)
-for the integration workflow and [SECURITY.md](SECURITY.md) for confidential
-vulnerability reports. Do not put credentials or customer inventories in an issue.
+Bug reports and pull requests are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md)
+for the development workflow and [SECURITY.md](SECURITY.md) to report a vulnerability
+privately. Keep credentials and customer inventories out of issues.
 
-Documentation: [docs.nocert.io](https://docs.nocert.io/sentinels/overview).
-Service: [nocert.io](https://nocert.io).
+Sentinel is licensed under [Apache-2.0](LICENSE). The vendored shared library
+uses MIT; dependency notices are in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).

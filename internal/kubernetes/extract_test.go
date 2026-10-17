@@ -58,7 +58,8 @@ func TestExtractPublicMaterialNeverReadsPrivateKeys(t *testing.T) {
 		"tls.key": []byte("-----BEGIN PRIVATE KEY-----\nSECRET\n-----END PRIVATE KEY-----\n"),
 		"extra":   []byte("password123"),
 	}
-	got := extractPublicMaterial(data, tlsSecretPublicKeys)
+	got, truncated := extractPublicMaterial(data, tlsSecretPublicKeys)
+	assert.False(t, truncated)
 	require.Len(t, got, 2)
 	for _, ec := range got {
 		assert.NotEqual(t, "tls.key", ec.dataKey)
@@ -68,7 +69,8 @@ func TestExtractPublicMaterialNeverReadsPrivateKeys(t *testing.T) {
 
 func TestExtractPublicMaterialFullchainOrderPreserved(t *testing.T) {
 	full := append(pemCert("LEAF"), pemCert("INTERMEDIATE")...)
-	got := extractPublicMaterial(map[string][]byte{"tls.crt": full}, []string{"tls.crt"})
+	got, truncated := extractPublicMaterial(map[string][]byte{"tls.crt": full}, []string{"tls.crt"})
+	assert.False(t, truncated)
 	require.Len(t, got, 2)
 	assert.Equal(t, shapedCert("LEAF"), got[0].der)
 	assert.Equal(t, shapedCert("INTERMEDIATE"), got[1].der)
@@ -78,11 +80,12 @@ func TestExtractPublicMaterialSkipsOversizedAndNonCert(t *testing.T) {
 	// Shape-valid but over the 64 KiB wire cap -> dropped by the size guard.
 	oversized := shapedCert(strings.Repeat("A", 65*1024))
 	require.Greater(t, len(oversized), maxDERBytes)
-	got := extractPublicMaterial(map[string][]byte{
+	got, truncated := extractPublicMaterial(map[string][]byte{
 		"tls.crt": oversized,
 		"ca.crt":  []byte("not a certificate at all"),
 	}, tlsSecretPublicKeys)
 	assert.Empty(t, got)
+	assert.True(t, truncated)
 }
 
 func TestExtractPublicMaterialRejectsPrivateKeyMaterial(t *testing.T) {
@@ -96,29 +99,69 @@ func TestExtractPublicMaterialRejectsPrivateKeyMaterial(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, byte(0x30), keyDER[0], "a PKCS#8 key opens with a SEQUENCE tag")
 
-	rawKey := extractPublicMaterial(map[string][]byte{"tls.crt": keyDER}, tlsSecretPublicKeys)
+	rawKey, truncated := extractPublicMaterial(map[string][]byte{"tls.crt": keyDER}, tlsSecretPublicKeys)
+	assert.False(t, truncated)
 	assert.Empty(t, rawKey, "raw private-key DER under tls.crt must not be extracted")
 
 	disguised := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: keyDER})
-	disguisedGot := extractPublicMaterial(map[string][]byte{"ca.crt": disguised}, tlsSecretPublicKeys)
+	disguisedGot, truncated := extractPublicMaterial(map[string][]byte{"ca.crt": disguised}, tlsSecretPublicKeys)
+	assert.False(t, truncated)
 	assert.Empty(t, disguisedGot, "a private key disguised in a CERTIFICATE PEM must not be extracted")
 
 	// Control: a real (shape-valid) certificate alongside is still extracted,
 	// proving the gate is discriminating, not rejecting everything.
-	ok := extractPublicMaterial(map[string][]byte{"tls.crt": pemCert("REAL")}, tlsSecretPublicKeys)
+	ok, truncated := extractPublicMaterial(map[string][]byte{"tls.crt": pemCert("REAL")}, tlsSecretPublicKeys)
+	assert.False(t, truncated)
 	require.Len(t, ok, 1)
 }
 
 func TestExtractPublicMaterialCapsCertsAtWireLimit(t *testing.T) {
 	// A hostile Secret packing many CERTIFICATE blocks into one data key must not
 	// exceed observed_chain_fingerprints maxItems (16) in the wire contract.
-	var full []byte
-	for i := 0; i < 40; i++ {
-		full = append(full, pemCert(fmt.Sprintf("C%d", i))...)
-	}
-	got := extractPublicMaterial(map[string][]byte{"tls.crt": full}, []string{"tls.crt"})
 	assert.Equal(t, 16, maxCertsPerValue)
-	assert.Len(t, got, maxCertsPerValue)
+	for _, count := range []int{0, 15, 16, 17, 40} {
+		t.Run(fmt.Sprint(count), func(t *testing.T) {
+			var full []byte
+			for i := 0; i < count; i++ {
+				full = append(full, pemCert(fmt.Sprintf("C%d", i))...)
+			}
+			full = append(full, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: []byte("ignored")})...)
+			full = append(full, '\n', ' ', '\t')
+			got, truncated := extractPublicMaterial(map[string][]byte{"tls.crt": full}, []string{"tls.crt"})
+			assert.Len(t, got, min(count, maxCertsPerValue))
+			assert.Equal(t, count > maxCertsPerValue, truncated)
+		})
+	}
+}
+
+func TestExtractPublicMaterialSizeBoundary(t *testing.T) {
+	der := shapedCert(strings.Repeat("A", maxDERBytes-13))
+	require.Len(t, der, maxDERBytes)
+	for _, value := range [][]byte{der, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})} {
+		got, truncated := extractPublicMaterial(map[string][]byte{"tls.crt": value}, tlsSecretPublicKeys)
+		require.Len(t, got, 1)
+		assert.Equal(t, der, got[0].der)
+		assert.False(t, truncated, "the exact size limit must remain complete")
+	}
+}
+
+func TestExtractPublicMaterialTruncationIsLimitedToAllowedKeys(t *testing.T) {
+	oversized := shapedCert(strings.Repeat("A", maxDERBytes))
+	got, truncated := extractPublicMaterial(map[string][]byte{
+		"tls.crt": oversized,
+		"ca.crt":  pemCert("CA"),
+	}, tlsSecretPublicKeys)
+	assert.True(t, truncated)
+	require.Len(t, got, 1, "an oversized certificate must not stop extraction from other keys")
+	assert.Equal(t, "ca.crt", got[0].dataKey)
+
+	got, truncated = extractPublicMaterial(map[string][]byte{
+		"tls.crt": pemCert("LEAF"),
+		"tls.key": oversized,
+	}, tlsSecretPublicKeys)
+	assert.False(t, truncated, "excluded keys must not affect completeness")
+	require.Len(t, got, 1)
+	assert.Equal(t, "tls.crt", got[0].dataKey)
 }
 
 func TestWellKnownTargetsNeverAllowlistKeyMaterial(t *testing.T) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/pem"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -215,6 +216,69 @@ func TestSweepIncompleteListNeverAuthorizesReconcile(t *testing.T) {
 		[]ClusterSpec{{Name: "prod"}}, SweepOptions{})
 	require.Len(t, res.Sweeps, 1)
 	assert.False(t, res.Sweeps[0].Complete)
+}
+
+func TestSweepExtractionLimitsDoNotStopOtherObjectsOrClusters(t *testing.T) {
+	var bundle []byte
+	for i := 0; i <= maxCertsPerValue; i++ {
+		bundle = append(bundle, pemCert(fmt.Sprintf("CHAIN-%d", i))...)
+	}
+	oversized := shapedCert(strings.Repeat("A", maxDERBytes))
+	oversizedPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: oversized})
+	for _, tc := range []struct {
+		name, kind, namespace, object, key string
+		value                              []byte
+		retained                           int
+	}{
+		{"secret chain", "secret", "default", "large", "tls.crt", bundle, maxCertsPerValue},
+		{"secret DER", "secret", "default", "large", "tls.crt", oversized, 0},
+		{"secret PEM", "secret", "default", "large", "tls.crt", oversizedPEM, 0},
+		{"mesh secret", "secret", "istio-system", "cacerts", "ca-cert.pem", bundle, maxCertsPerValue},
+		{"mesh configmap", "configmap", "linkerd", "linkerd-identity-trust-roots", "ca-bundle.crt", oversizedPEM, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			good := secret{Metadata: objectMeta{Namespace: "default", Name: "good"}, Type: tlsSecretType,
+				Data: map[string][]byte{"tls.crt": pemCert("GOOD")}}
+			affected := &fakeAPI{complete: true}
+			meta := objectMeta{Namespace: tc.namespace, Name: tc.object}
+			if tc.kind == "secret" {
+				affected.secrets = []secret{{Metadata: meta, Type: tlsSecretType, Data: map[string][]byte{tc.key: tc.value}}}
+			} else {
+				affected.configMaps = map[string]configMap{tc.namespace + "/" + tc.object: {
+					Metadata: meta, Data: map[string]string{tc.key: string(tc.value)},
+				}}
+			}
+			affected.secrets = append(affected.secrets, good)
+			orig := newClusterAPI
+			newClusterAPI = func(spec ClusterSpec) (clusterAPI, error) {
+				if spec.Name == "affected" {
+					return affected, nil
+				}
+				return &fakeAPI{complete: true, secrets: []secret{good}}, nil
+			}
+			t.Cleanup(func() { newClusterAPI = orig })
+
+			res := NewScanner(slog.Default()).Sweep(context.Background(),
+				[]ClusterSpec{{Name: "affected"}, {Name: "unaffected"}}, SweepOptions{})
+
+			require.Len(t, res.Sweeps, 2)
+			assert.True(t, res.Truncated)
+			assert.False(t, res.Sweeps[0].Complete, "partial extraction must not authorize reconciliation")
+			assert.Equal(t, "truncated", res.Sweeps[0].Reason)
+			assert.True(t, res.Sweeps[1].Complete, "an object limit must not stop later clusters")
+			assert.Empty(t, res.Sweeps[1].Reason)
+			for _, sweep := range res.Sweeps {
+				assert.Contains(t, sweep.ObservedKeys, "secret/default/good/tls.crt")
+			}
+			assert.Len(t, res.Certificates, tc.retained+1)
+			key := LocationKey(tc.kind, tc.namespace, tc.object, tc.key)
+			if tc.retained == 0 {
+				assert.NotContains(t, res.Sweeps[0].ObservedKeys, key)
+			} else {
+				assert.Contains(t, res.Sweeps[0].ObservedKeys, key)
+			}
+		})
+	}
 }
 
 func TestSweepBytesBudgetTruncates(t *testing.T) {
