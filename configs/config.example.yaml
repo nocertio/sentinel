@@ -1,0 +1,39 @@
+# nocert-sentinel: TLS certificate monitoring agent
+# https://nocert.io
+
+# NoCert hosted backend URL. Override it only for self-hosted deployments.
+server_url: "https://sentinel.nocert.io"
+
+# First-boot enrollment token (format: ncse_...), minted in the NoCert dashboard.
+# Prefer the NOCERT_ENROLL_TOKEN env var (e.g. via /etc/nocert-sentinel/enroll.env)
+# over baking the token here; keep secrets out of images.
+# Ignored once a key is already enrolled on this host.
+# enroll_token: ""
+
+# The settings below are optional; the values shown are the defaults.
+
+# Scan types this sentinel performs. These are local kill switches:
+# a disabled type is never run, even if the backend requests it.
+# allow_network_scan: true
+# allow_filesystem_scan: true
+# allow_local_scan: true
+
+# Logging.
+# log_level: info      # debug, info, warn, error
+# log_format: json     # json, text
+
+# How often to poll the backend for work.
+# polling_interval: 30s
+
+# Kubernetes connector (optional). The sentinel reads TLS Secrets through the
+# cluster API server; credentials stay on this host and are never sent to the
+# backend. The connector needs a read-only ServiceAccount with get/list on
+# secrets and configmaps.
+# allow_kubernetes_scan: true
+# kubernetes_clusters:
+#   - name: prod
+#     server: https://10.0.0.10:6443
+#     ca_file: /etc/nocert-sentinel/k8s/prod-ca.crt
+#     token_file: /etc/nocert-sentinel/k8s/prod-token
+#   - name: staging
+#     kubeconfig: /etc/nocert-sentinel/k8s/staging.kubeconfig

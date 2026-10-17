@@ -1,0 +1,24 @@
+name: Bug report
+description: Report a reproducible Sentinel problem.
+body:
+  - type: markdown
+    attributes:
+      value: Use SECURITY.md for vulnerabilities. Remove credentials, real inventory data and private hostnames from reports.
+  - type: input
+    id: version
+    attributes:
+      label: Sentinel version and Linux distribution
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Include a minimal synthetic configuration, expected result and observed result.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs
+      render: text

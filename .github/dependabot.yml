@@ -1,0 +1,9 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+# Go dependencies are refreshed with their vendored sources by maintainers.
+# Public CI also checks the Go vulnerability database.

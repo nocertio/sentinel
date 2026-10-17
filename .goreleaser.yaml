@@ -1,0 +1,86 @@
+version: 2
+project_name: nocert-sentinel
+
+builds:
+  - id: nocert-sentinel
+    main: ./cmd/nocert-sentinel
+    binary: nocert-sentinel
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+      - -buildvcs=false
+      - -mod=vendor
+    ldflags:
+      - -s -w
+      - -X nocert.io/sentinel/internal/version.Version={{.Version}}
+    goos: [linux]
+    goarch: [amd64, arm64]
+    mod_timestamp: '{{ .CommitTimestamp }}'
+
+nfpms:
+  - id: nocert-sentinel
+    package_name: nocert-sentinel
+    vendor: NoCert
+    maintainer: NoCert <operations@nocert.io>
+    description: |
+      NoCert Sentinel - on-premise agent that monitors TLS certificates
+      on internal networks and reports findings to the NoCert backend.
+    license: Apache-2.0
+    homepage: https://nocert.io
+    section: net
+    formats: [deb]
+    bindir: /usr/bin
+    contents:
+      - src: configs/config.example.yaml
+        dst: /etc/nocert-sentinel/config.yaml
+        type: config|noreplace
+        file_info: { mode: 0640 }
+      - src: systemd/nocert-sentinel.service
+        dst: /lib/systemd/system/nocert-sentinel.service
+        file_info: { mode: 0644 }
+      - src: LICENSE
+        dst: /usr/share/doc/nocert-sentinel/copyright
+        file_info: { mode: 0644 }
+      - src: THIRD_PARTY_NOTICES
+        dst: /usr/share/doc/nocert-sentinel/THIRD_PARTY_NOTICES
+        file_info: { mode: 0644 }
+    scripts:
+      postinstall: scripts/postinstall.sh
+      preremove: scripts/preremove.sh
+
+archives:
+  - formats: [tar.gz]
+    builds_info:
+      owner: root
+      group: root
+    files:
+      - src: LICENSE
+        info: {owner: root, group: root}
+      - src: THIRD_PARTY_NOTICES
+        info: {owner: root, group: root}
+      - src: README.md
+        info: {owner: root, group: root}
+
+checksum:
+  name_template: 'checksums.txt'
+
+changelog:
+  disable: true
+
+release:
+  disable: true
+
+snapshot:
+  version_template: '{{ incpatch .Version }}~pre.0'
+
+source:
+  enabled: true
+  name_template: "{{ .ProjectName }}-{{ .Version }}-source"
+sboms:
+  - artifacts: binary
+    cmd: syft
+    args: ["$artifact", "--output", "spdx-json=$document"]
+
+# Assemble with scripts/release-assets.py before signing its final checksums.
+# dist/ contains build diagnostics and is never a publication directory.

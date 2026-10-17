@@ -1,0 +1,57 @@
+[Unit]
+Description=NoCert Sentinel - Certificate Monitoring Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# First-boot self-enroll: cloud-init / the operator drops NOCERT_ENROLL_TOKEN here.
+# Optional (leading "-"): a normally-enrolled host has no such file and must still start.
+EnvironmentFile=-/etc/nocert-sentinel/enroll.env
+ExecStart=/usr/bin/nocert-sentinel --config /etc/nocert-sentinel/config.yaml
+Restart=on-failure
+RestartSec=10
+
+User=nocert-sentinel
+Group=nocert-sentinel
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/etc/nocert-sentinel
+PrivateTmp=true
+PrivateDevices=true
+UMask=0077
+# ~50 concurrent scan workers plus a handful of config/cert file reads; 4096 is
+# generous headroom for this workload.
+LimitNOFILE=4096
+
+# The agent runs as an unprivileged user and needs no capabilities: it makes
+# outbound TCP connections, reads world-readable cert files under /etc, and
+# reads /proc/net/tcp. Drop every capability and lock down the rest of the host.
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+# @system-service covers a Go network daemon (dial, /proc reads, netlink
+# interface enumeration); validated with no seccomp denials.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# AF_NETLINK is needed to enumerate the host's own interface addresses.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nocert-sentinel
+
+[Install]
+WantedBy=multi-user.target

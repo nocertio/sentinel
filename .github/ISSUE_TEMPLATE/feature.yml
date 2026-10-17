@@ -1,0 +1,15 @@
+name: Feature request
+description: Discuss a use case and a proposed change.
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What do you need to do?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior and alternatives
+    validations:
+      required: true

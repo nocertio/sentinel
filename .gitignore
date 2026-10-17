@@ -1,0 +1,8 @@
+/nocert-sentinel
+/dist/
+/release/
+*.test
+coverage.out
+.env
+.env.*
+.DS_Store

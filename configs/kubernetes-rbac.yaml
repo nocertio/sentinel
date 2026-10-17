@@ -1,0 +1,73 @@
+# Read-only access for the NoCert sentinel Kubernetes connector.
+#
+# This manifest is duplicated as a constant in the "Add cluster" wizard
+# (nocert-app/frontend/src/components/sentinels/AddClusterModal.tsx). When you
+# change the RBAC rules here, propagate the change there too.
+#
+# What this grants: get/list on Secrets (cluster-wide) and get on ConfigMaps.
+# Kubernetes RBAC cannot restrict Secret access by type or by field, so any
+# reader of Secrets can technically read them all - that is true of every
+# product in this space. What NoCert does about it:
+#   - the connector lists with a server-side fieldSelector
+#     (type=kubernetes.io/tls), so non-TLS Secret values never reach it,
+#   - the whole Secret is decoded into memory (no field projection exists), but
+#     the agent reads only the allowlisted public data keys out of it (tls.crt,
+#     ca.crt, mesh CA certs); the tls.key value is never read out, copied,
+#     logged, or shipped,
+#   - the wire protocol has no field that could carry key material,
+#   - the agent is open source: verify all of the above in the code.
+# See docs/KUBERNETES.md, including the namespace-scoped variant.
+#
+# After applying, mint a long-lived token and hand the trio to the sentinel:
+#   kubectl -n nocert-sentinel get secret nocert-sentinel-reader-token \
+#     -o jsonpath='{.data.token}' | base64 -d > /etc/nocert-sentinel/k8s/prod-token
+#   kubectl -n nocert-sentinel get secret nocert-sentinel-reader-token \
+#     -o jsonpath='{.data.ca\.crt}' | base64 -d > /etc/nocert-sentinel/k8s/prod-ca.crt
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nocert-sentinel
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: nocert-sentinel-reader
+  namespace: nocert-sentinel
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: nocert-sentinel-reader-token
+  namespace: nocert-sentinel
+  annotations:
+    kubernetes.io/service-account.name: nocert-sentinel-reader
+type: kubernetes.io/service-account-token
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: nocert-sentinel-reader
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list"]   # no watch: one-shot get/list sweep per backend task
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get"]           # targeted gets of well-known trust bundles only
+---
+# Cluster-wide binding (default). For namespace-scoped access instead, delete
+# this ClusterRoleBinding and create one RoleBinding per namespace referencing
+# the ClusterRole above, then set the same namespaces in the sentinel's
+# include list (NoCert UI, sentinel scan settings).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: nocert-sentinel-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: nocert-sentinel-reader
+subjects:
+  - kind: ServiceAccount
+    name: nocert-sentinel-reader
+    namespace: nocert-sentinel

@@ -1,0 +1,26 @@
+# github.com/davecgh/go-spew v1.1.1
+## explicit
+github.com/davecgh/go-spew/spew
+# github.com/pmezard/go-difflib v1.0.0
+## explicit
+github.com/pmezard/go-difflib/difflib
+# github.com/stretchr/testify v1.11.1
+## explicit; go 1.17
+github.com/stretchr/testify/assert
+github.com/stretchr/testify/assert/yaml
+github.com/stretchr/testify/require
+# golang.org/x/crypto v0.50.0
+## explicit; go 1.25.0
+golang.org/x/crypto/cryptobyte
+golang.org/x/crypto/cryptobyte/asn1
+# gopkg.in/yaml.v3 v3.0.1
+## explicit
+gopkg.in/yaml.v3
+# nocert.io/common v0.0.0
+## explicit; go 1.26.0
+nocert.io/common/pkg/api/sentinel
+nocert.io/common/pkg/certinfo
+nocert.io/common/pkg/httpsig
+nocert.io/common/pkg/tlsconst
+nocert.io/common/pkg/tlsenum
+nocert.io/common/pkg/tlsprobe
