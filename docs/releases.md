@@ -12,9 +12,10 @@ goreleaser release --snapshot --clean --skip=publish,sign
 python3 scripts/release-assets.py
 ```
 
-The manual GitHub workflow builds that same unsigned candidate without signing
-keys. An operator reviews and promotes a release separately. Pull requests
-cannot trigger a signing or publishing job.
+The manual GitHub workflow checks that these assets can be built. It does not
+upload them. Distribution files are built, checked and signed in the maintainer's
+release environment before upload. Pull requests cannot trigger a signing or
+publishing job.
 
 For an approved tag, an operator with the signing key available runs:
 

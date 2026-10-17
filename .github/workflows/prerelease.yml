@@ -1,4 +1,4 @@
-name: Build prerelease candidate
+name: Verify release build
 on:
   workflow_dispatch:
 permissions:
@@ -23,10 +23,6 @@ jobs:
       - run: go test -mod=vendor -race ./...
       - run: goreleaser release --snapshot --clean --skip=publish,sign
       - run: python3 scripts/release-assets.py
-      - name: Upload unsigned review artifacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: unsigned-prerelease-candidate
-          retention-days: 7
-          path: release/*
-      # No release creation, registry push or signing credentials in this job.
+      # Build validation only. Distribution files are checked and signed in the
+      # maintainer's release environment before they are uploaded separately.
+      # No artifact upload, release creation, registry push or signing credentials.

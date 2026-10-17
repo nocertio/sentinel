@@ -134,7 +134,8 @@ GOTOOLCHAIN=go1.27.2 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 Replace `VERSION` with the release version; use `GOARCH=arm64` for ARM64.
 To reproduce a distributed binary, start from that release's signed source
 archive and use the same compiler and flags. See [release verification](docs/releases.md).
-GitHub workflow artifacts are unsigned build candidates, not official releases.
+Use signed release files for distribution. GitHub workflows verify builds without
+uploading distribution files.
 
 The [Dockerfile](Dockerfile) supports source builds for network and Kubernetes
 collection. Follow the [container instructions](docs/container.md) for its scope
