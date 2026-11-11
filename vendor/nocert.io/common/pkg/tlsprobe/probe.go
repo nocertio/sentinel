@@ -12,37 +12,27 @@ import (
 	"nocert.io/common/pkg/tlsconst"
 )
 
-// DefaultALPN is the ALPN protocol list advertised by Probe in the
-// ClientHello. Real HTTPS servers (nginx, apache, caddy, IIS, Go's
-// stdlib) negotiate one of these; non-HTTP TLS services (SMTPS, IMAPS,
-// LDAPS, DoT, AMQPS) leave NegotiatedProtocol empty. Test servers and
-// any code that wants to mirror Probe's offer should use this list.
+// DefaultALPN is the HTTP protocol list advertised by Probe. Inventory callers
+// can set DisableALPN to avoid excluding services with other application protocols.
 var DefaultALPN = []string{"h2", "http/1.1"}
 
-// legacyCipherSuites is the explicit ≤TLS 1.2 cipher-suite offer used by the
-// inventory handshake: the union of Go's secure and INSECURE ≤1.2 suites
-// (strong ones first), deduplicated. Offering the weak suites (RSA key
-// exchange, CBC-SHA, 3DES/RC4 where the toolchain still exposes them) is
-// deliberate - this is a read-only inventory probe with InsecureSkipVerify
-// that sends no credentials and no application data. The goal is only to
-// complete a handshake with a legacy-only endpoint so its certificate and
-// negotiated version become observable; a permissive offer maximises the set
-// of legacy servers we can inventory, and the confidentiality of the (empty)
-// payload is irrelevant. TLS 1.3 suites are intentionally excluded: crypto/tls
-// ignores CipherSuites for TLS 1.3, so listing them would be meaningless.
+// legacyCipherSuites offers all TLS <= 1.2 suites supported by crypto/tls,
+// including weak suites needed to inventory legacy endpoints. The probe sends
+// no credentials or application data. TLS 1.3 suites are controlled by Go.
 var legacyCipherSuites = buildLegacyCipherSuites()
 
 func buildLegacyCipherSuites() []uint16 {
-	tls13 := map[uint16]bool{
-		tls.TLS_AES_128_GCM_SHA256:       true,
-		tls.TLS_AES_256_GCM_SHA384:       true,
-		tls.TLS_CHACHA20_POLY1305_SHA256: true,
-	}
 	seen := make(map[uint16]bool)
 	ids := make([]uint16, 0, 32)
 	add := func(suites []*tls.CipherSuite) {
 		for _, s := range suites {
-			if tls13[s.ID] || seen[s.ID] {
+			legacy := false
+			for _, v := range s.SupportedVersions {
+				if v <= tls.VersionTLS12 {
+					legacy = true
+				}
+			}
+			if !legacy || seen[s.ID] {
 				continue
 			}
 			seen[s.ID] = true
@@ -55,6 +45,10 @@ func buildLegacyCipherSuites() []uint16 {
 }
 
 type Result struct {
+	// RawChain is set by collectors that do not parse X.509.
+	RawChain           [][]byte
+	ObservedServerName *string
+
 	Certificate *certinfo.CertificateInfo
 	Chain       []certinfo.ChainEntry
 	TLS         *certinfo.TLSObservation
@@ -89,10 +83,14 @@ func Probe(ctx context.Context, host string, port int, opts Options) (*Result, e
 		peerIP = tcpAddr.IP.String()
 	}
 
+	alpn := DefaultALPN
+	if opts.DisableALPN {
+		alpn = nil
+	}
 	tlsConn := tls.Client(tcpConn, &tls.Config{
 		InsecureSkipVerify: true,
 		ServerName:         serverName,
-		NextProtos:         DefaultALPN,
+		NextProtos:         alpn,
 		// Inventory probe: negotiate down to TLS 1.0 so a legacy-only endpoint
 		// is still observed (cert + negotiated version) instead of vanishing.
 		// MaxVersion stays unset, so TLS 1.3 remains enabled and preferred with
@@ -100,15 +98,8 @@ func Probe(ctx context.Context, host string, port int, opts Options) (*Result, e
 		// has no effect on the (non-configurable) TLS 1.3 suites Go negotiates.
 		MinVersion:   tls.VersionTLS10,
 		CipherSuites: legacyCipherSuites,
-		// CurvePreferences is intentionally left unset. An explicit list can only
-		// SUBTRACT from Go's default (crypto/tls ignores the list order and just
-		// filters the default down to it), so pinning one silently drops any group
-		// not enumerated - including the post-quantum ML-KEM hybrids Go enables by
-		// default (X25519MLKEM768 since 1.24; SecP256r1MLKEM768 + SecP384r1MLKEM1024
-		// since 1.26) and any future group. For an inventory probe that must OBSERVE
-		// PQC key exchange, tracking the default is correct and picks up new groups
-		// with no code change. (This does not enlarge the ClientHello: Go leads the
-		// default with X25519MLKEM768, so the big keyshare is sent either way.)
+		// Use Go's default groups to observe exchanges supported by the active
+		// toolchain, including newly supported post-quantum groups.
 	})
 
 	handshakeCtx, handshakeCancel := context.WithTimeout(ctx, opts.HandshakeTimeout)
@@ -161,8 +152,10 @@ func Probe(ctx context.Context, host string, port int, opts Options) (*Result, e
 }
 
 func extractTLSObservation(state *tls.ConnectionState) *certinfo.TLSObservation {
+	version, cipher, group := state.Version, state.CipherSuite, uint16(state.CurveID)
 	return &certinfo.TLSObservation{
-		TLSVersion:      tlsconst.VersionString(state.Version),
+		TLSVersion:   tlsconst.VersionString(state.Version),
+		TLSVersionID: &version, CipherSuiteID: &cipher, NegotiatedGroupID: &group,
 		CipherSuite:     tlsconst.CipherName(state.CipherSuite),
 		NegotiatedGroup: tlsconst.GroupString(state.CurveID),
 		OCSPStapling:    len(state.OCSPResponse) > 0,

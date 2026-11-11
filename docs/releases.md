@@ -2,7 +2,7 @@
 
 The source includes a GoReleaser configuration for Linux amd64/arm64 binaries,
 tar archives, Debian packages, a source archive, SPDX SBOMs and SHA-256 sums.
-Use Go 1.27.2, GoReleaser 2.15.4, Syft 1.54.1 and Python 3. This configuration does not
+Use Go 1.27.4, GoReleaser 2.15.4, Syft 1.54.1 and Python 3. This configuration does not
 publish to any repository, registry or release service.
 
 For an unsigned local candidate:
@@ -48,3 +48,6 @@ Do not treat a test key or unsigned workflow artifact as an official release.
 For reproducibility, compare the unpacked agent binaries with a rebuild using
 the exact release version, compiler and flags in the README. Package archive
 metadata, SBOM timestamps and container layers are outside that claim.
+
+Each release includes an SPDX inventory for each architecture, covered by the
+signed checksums. It records the binary's SHA-256 and linked Go modules.

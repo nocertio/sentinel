@@ -5,5 +5,7 @@ package certinfo
 import "crypto/x509"
 
 func extendedPublicKeyName(cert *x509.Certificate) string {
-	return cert.PublicKeyAlgorithm.String()
+	return classicalPublicKeyName(cert.PublicKeyAlgorithm)
 }
+
+func extendedSignatureName(_ x509.SignatureAlgorithm) string { return "unknown" }

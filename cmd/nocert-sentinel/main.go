@@ -30,8 +30,13 @@ const serviceUnit = "nocert-sentinel"
 func main() {
 	configPath := flag.String("config", "/etc/nocert-sentinel/config.yaml", "path to configuration file")
 	enrollToken := flag.String("enroll-token", "", "enroll once with this token, then exit (prefer NOCERT_ENROLL_TOKEN env; argv is visible via ps/proc)")
+	checkImage := flag.Bool("check-image", false, "check that a stopped VM template contains no Sentinel identity or enrollment token, then exit")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+	if *checkImage && (*enrollToken != "" || *showVersion) {
+		fmt.Fprintln(os.Stderr, "error: --check-image cannot be combined with --enroll-token or --version")
+		os.Exit(1)
+	}
 
 	if *showVersion {
 		fmt.Println(version.String())
@@ -42,6 +47,15 @@ func main() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
+	}
+
+	if *checkImage {
+		if err := checkTemplate(cfg, os.Getenv("NOCERT_ENROLL_TOKEN"), "/etc/nocert-sentinel/enroll.env"); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("No Sentinel identity or enrollment token found. Keep the service stopped until deployment.")
+		return
 	}
 
 	// When run privileged (a `sudo --enroll-token` re-enrollment), the key write
@@ -70,9 +84,8 @@ func main() {
 
 	// The --enroll-token FLAG is the manual one-shot: force a fresh enrollment
 	// (replacing any existing key) then exit. A token from config/env is
-	// different: it feeds service-mode self-enroll, which is IDEMPOTENT - an
-	// already-enrolled clone (key file present) reuses its identity and ignores
-	// the token. That split is what makes the token safe to bake into a VM image.
+	// different: it feeds first-boot enrollment and preserves an existing identity.
+	// Templates must contain neither credentials nor an enrollment token.
 	s := sentinel.New(cfg, logger)
 
 	if *enrollToken != "" {

@@ -13,7 +13,9 @@ import (
 	"log/slog"
 	"math/big"
 	"net"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -22,6 +24,49 @@ import (
 	"nocert.io/common/pkg/certinfo"
 	"nocert.io/common/pkg/tlsprobe"
 )
+
+type pendingResultProber struct{ calls atomic.Int32 }
+
+func (p *pendingResultProber) Probe(context.Context, string, int, time.Duration, string) (*tlsprobe.Result, error) {
+	p.calls.Add(1)
+	return &tlsprobe.Result{PeerIP: "192.0.2.1", RawChain: [][]byte{{0x30, 0x00}}}, nil
+}
+
+func TestTargetedScanBackpressureAndCancellation(t *testing.T) {
+	for _, hostname := range []bool{false, true} {
+		t.Run(fmt.Sprint("hostname=", hostname), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				prober := &pendingResultProber{}
+				s := NewWithProber(slog.Default(), prober)
+				s.SetGentle(true)
+				ports := make([]int, 1000)
+				targets := make([]Target, len(ports))
+				for i := range ports {
+					ports[i] = 443 + i
+					targets[i] = Target{Host: "192.0.2.1", Port: ports[i]}
+				}
+				var results <-chan ProbeOutput
+				workers := 5
+				if hostname {
+					workers = 1
+					results, _ = s.ScanHostname(ctx, "fixture.invalid", ports, time.Second, false)
+				} else {
+					results, _ = s.ScanTargets(ctx, targets, time.Second)
+				}
+				// A consumer blocked on delivery must stop the scan from running ahead.
+				time.Sleep(10 * time.Second)
+				synctest.Wait()
+				require.LessOrEqual(t, cap(results), 2*workers)
+				require.Equal(t, int32(cap(results)+workers), prober.calls.Load())
+				cancel()
+				for range results {
+				}
+			})
+		})
+	}
+}
 
 // generateTestCA creates a self-signed CA certificate and key pair for testing.
 func generateTestCA() (certPEM []byte, keyPEM []byte, cert *x509.Certificate, key *ecdsa.PrivateKey) {
@@ -330,6 +375,7 @@ func TestProbeResultToOutput_AttachesCipherEnumeration(t *testing.T) {
 		require.NotNil(t, out.TLS)
 		assert.Equal(t, findings, out.TLS.CipherEnumeration)
 		assert.True(t, out.TLS.DeepEnumAttempted)
+		assert.Equal(t, "tls-cert-v1", out.TLS.CipherEnumerationProfile)
 		assert.Equal(t, "TLS 1.2", out.TLS.TLSVersion)
 	})
 
@@ -342,6 +388,7 @@ func TestProbeResultToOutput_AttachesCipherEnumeration(t *testing.T) {
 		require.NotNil(t, out.TLS, "enum-only result should still get a TLS sub-struct")
 		assert.Equal(t, findings, out.TLS.CipherEnumeration)
 		assert.True(t, out.TLS.DeepEnumAttempted)
+		assert.Equal(t, "tls-cert-v1", out.TLS.CipherEnumerationProfile)
 		assert.Empty(t, out.TLS.TLSVersion, "TLS sub-struct fields stay zero when no fast-probe TLS")
 	})
 
@@ -789,60 +836,14 @@ func TestScanStream_ContextCancellation(t *testing.T) {
 	assert.Less(t, count, 254)
 }
 
-func TestExpandAllCIDRs_Shuffled(t *testing.T) {
-	s := New(slog.Default())
-
-	ips1 := s.expandAllCIDRs([]string{"10.0.0.0/24"})
-	ips2 := s.expandAllCIDRs([]string{"10.0.0.0/24"})
-
-	assert.Len(t, ips1, 254)
-	assert.Len(t, ips2, 254)
-
-	// Same IPs, different order
-	set1 := map[string]bool{}
-	set2 := map[string]bool{}
-	for _, ip := range ips1 {
-		set1[ip.String()] = true
-	}
-	for _, ip := range ips2 {
-		set2[ip.String()] = true
-	}
-	assert.Equal(t, set1, set2)
-
-	different := 0
-	for i := range ips1 {
-		if ips1[i].String() != ips2[i].String() {
-			different++
-		}
-	}
-	assert.Greater(t, different, 0, "two shuffles of 254 IPs should differ")
-}
-
-// TestExpandAllCIDRs_TruncatesAtCap guards the OOM bound on the CIDR
-// aggregate break site: two /16s expand past MaxTotalTargets, so the
-// aggregate is trimmed to the cap.
-func TestExpandAllCIDRs_TruncatesAtCap(t *testing.T) {
-	s := New(slog.Default())
-	ips := s.expandAllCIDRs([]string{"10.0.0.0/16", "10.1.0.0/16"})
-	assert.Len(t, ips, MaxTotalTargets)
-}
-
-// TestScanStream_TruncatesTargetsAtCap guards the OOM bound on the
-// per-port target break site: one wide CIDR crossed with several ports
-// exceeds MaxTotalTargets, so the assembled target set is capped.
-func TestScanStream_TruncatesTargetsAtCap(t *testing.T) {
+func TestScanStream_LargeScopeIsNotTruncated(t *testing.T) {
 	s := NewWithProber(slog.Default(), &mockProber{})
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // don't actually probe; we only assert the pre-computed target count
-
-	_, meta := s.ScanStream(ctx, ScanConfig{
-		IPRanges:      []string{"10.0.0.0/17"}, // ~32766 IPs
-		Ports:         []int{80, 443, 8443, 8080},
-		Timeout:       time.Second,
-		Workers:       1,
-		MaxConnPerSec: 1,
-	})
-	assert.Equal(t, MaxTotalTargets, meta.TotalTargets)
+	cancel()
+	ch, meta := s.ScanStream(ctx, ScanConfig{IPRanges: []string{"10.0.0.0/16"}, Ports: []int{80, 443, 8443, 8080}})
+	for range ch {
+	}
+	assert.Equal(t, 65534*4, meta.TotalTargets)
 }
 
 // TestFingerprint_Stable verifies the fingerprint helper produces a
@@ -856,4 +857,15 @@ func TestFingerprint_Stable(t *testing.T) {
 	assert.Equal(t, fp, Fingerprint(der))
 	// Different input → different fingerprint.
 	assert.NotEqual(t, fp, Fingerprint(append(der, 0x04)))
+}
+
+func TestProbeResultToOutputPreservesWireIDs(t *testing.T) {
+	_, der := makeTestCert(t)
+	version, cipher, group := uint16(0xFEFD), uint16(0xFEFE), uint16(0xFEFF)
+	s := NewWithProber(slog.Default(), nil)
+	out := s.probeResultToOutput(443, "", &tlsprobe.Result{Certificate: &certinfo.CertificateInfo{Fingerprint: "FE:ED", RawDER: der}, PeerIP: "192.0.2.1", TLS: &certinfo.TLSObservation{TLSVersionID: &version, CipherSuiteID: &cipher, NegotiatedGroupID: &group}}, nil, false)
+	require.Equal(t, &version, out.TLS.TLSVersionID)
+	require.Equal(t, &cipher, out.TLS.CipherSuiteID)
+	require.Equal(t, &group, out.TLS.NegotiatedGroupID)
+	require.Empty(t, out.TLS.CipherEnumerationProfile)
 }

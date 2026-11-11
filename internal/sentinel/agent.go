@@ -7,14 +7,15 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	commonsentinel "nocert.io/common/pkg/api/sentinel"
 	"nocert.io/sentinel/internal/config"
+	"nocert.io/sentinel/internal/dnszone"
 	"nocert.io/sentinel/internal/filesystem"
 	"nocert.io/sentinel/internal/keystore"
 	"nocert.io/sentinel/internal/kubernetes"
@@ -26,6 +27,9 @@ import (
 
 const maxRegisterRetries = 5
 
+// Tests shorten the wait without changing the registration retry policy.
+var registrationRetryInterval = 10 * time.Second
+
 const (
 	batchSize    = 50
 	batchTimeout = 30 * time.Second
@@ -34,8 +38,8 @@ const (
 )
 
 // Consecutive credential rejections before the poll loop escalates, then how
-// often it repeats the alert. Sized on the default 30s interval: about two
-// minutes before the first error, then one reminder every ten minutes.
+// often it repeats the alert. These count failed polls; backoff changes the
+// elapsed time between reminders.
 const (
 	credentialAlertAfter  = 5
 	credentialAlertRepeat = 20
@@ -49,13 +53,15 @@ const (
 // no internal cron, no /config fetch - the freshest SentinelConfig comes
 // embedded in every TasksResponse.
 type Sentinel struct {
-	cfg     *config.Config
-	store   *keystore.Store
-	scanner *scanner.Scanner
-	logger  *slog.Logger
+	cfg       *config.Config
+	store     *keystore.Store
+	scanner   *scanner.Scanner
+	logger    *slog.Logger
+	machineID string
 
 	// HTTP transport client (set after registration)
-	client *transport.Client
+	client     *transport.Client
+	sentinelID string
 
 	// Dynamic state (cached scan config)
 	mu         sync.RWMutex
@@ -82,6 +88,9 @@ type Sentinel struct {
 	// credentialFailures counts consecutive polls the backend rejected. Owned by
 	// the poll loop, so it needs no lock.
 	credentialFailures int
+	// Sweep progress is owned by the poll loop, not the scanner workers.
+	sweep            *networkSweep
+	checkpointFailed bool
 }
 
 func New(cfg *config.Config, logger *slog.Logger) *Sentinel {
@@ -92,6 +101,7 @@ func New(cfg *config.Config, logger *slog.Logger) *Sentinel {
 		fsScanner:    filesystem.NewScanner(),
 		kubeScanner:  kubernetes.NewScanner(logger),
 		logger:       logger,
+		machineID:    keystore.CurrentMachineID(),
 		batchTimeout: batchTimeout,
 	}
 }
@@ -103,6 +113,8 @@ func (s *Sentinel) Run(ctx context.Context, registerToken string) error {
 	if err != nil {
 		return fmt.Errorf("registration: %w", err)
 	}
+
+	s.sentinelID = kf.SentinelID
 
 	privKey, err := kf.PrivateKeyBytes()
 	if err != nil {
@@ -179,12 +191,10 @@ func (s *Sentinel) ensureRegistered(ctx context.Context, token string) (*keystor
 		if err != nil {
 			return nil, err
 		}
-		if cur := keystore.CurrentMachineID(); cur != "" && kf.MachineID != "" && kf.MachineID != cur {
-			s.logger.Warn("key file belongs to a different machine (cloned image?); discarding and re-enrolling",
-				"key_machine_id", kf.MachineID, "host_machine_id", cur)
+		if s.machineID != "" && kf.MachineID != "" && kf.MachineID != s.machineID {
+			s.logger.Warn("key file belongs to a different machine; re-enrollment required")
 			kf, err := s.registerWithToken(ctx, token)
 			if errors.Is(err, ErrTokenRequired) {
-				// A cloned host discarded its foreign key but has no token to re-enroll.
 				return nil, fmt.Errorf("cloned host (machine-id changed) needs a re-enrollment token; set NOCERT_ENROLL_TOKEN or enroll_token: %w", err)
 			}
 			return kf, err
@@ -234,7 +244,7 @@ func (s *Sentinel) registerWithToken(ctx context.Context, token string) (*keysto
 		KeyExpiresAt:     resp.KeyExpiresAt,
 		SigningPublicKey: resp.SigningPublicKey,
 		SigningKeyID:     signingKeyID,
-		MachineID:        keystore.CurrentMachineID(),
+		MachineID:        s.machineID,
 	}
 
 	if err := s.store.Save(kf); err != nil {
@@ -268,13 +278,13 @@ func (s *Sentinel) doRegister(ctx context.Context, token, pubKeyB64 string) (*tr
 		}
 		lastErr = err
 
-		// Don't retry client errors (4xx) - only retry on network/server errors
-		errMsg := err.Error()
-		if strings.Contains(errMsg, "status 4") {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if !transport.Retryable(err) || attempt == maxRegisterRetries-1 {
 			return nil, err
 		}
-
-		delay := 10 * time.Second
+		delay := requestDelay(registrationRetryInterval, attempt+1, err)
 		s.logger.Warn("registration failed, retrying",
 			"delay", delay,
 			"attempt", attempt+1,
@@ -288,31 +298,6 @@ func (s *Sentinel) doRegister(ctx context.Context, token, pubKeyB64 string) (*tr
 		}
 	}
 	return nil, lastErr
-}
-
-// pollLoop polls /tasks at the configured interval. Each response carries
-// the freshest SentinelConfig (cached in s.scanConfig) and a list of tasks
-// to execute. Tasks are dispatched in order; we don't fan out to goroutines
-// (the rest of the binary assumes one scan at a time, and the scanning
-// guards enforce that anyway).
-//
-// This is the only loop in the sentinel - no internal scheduler, no
-// per-scan ticker. Periodic CIDR/FS sweeps are emitted by the backend as
-// regular tasks.
-func (s *Sentinel) pollLoop(ctx context.Context) error {
-	ticker := time.NewTicker(s.cfg.PollingInterval)
-	defer ticker.Stop()
-
-	s.trackPollResult(s.pollOnce(ctx), "initial poll failed")
-
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-ticker.C:
-			s.trackPollResult(s.pollOnce(ctx), "poll failed")
-		}
-	}
 }
 
 // trackPollResult logs the outcome of one poll. A backend that rejects our
@@ -357,6 +342,9 @@ func (s *Sentinel) pollOnce(ctx context.Context) error {
 	s.applyConfig(resp.Config)
 
 	for _, task := range resp.Tasks {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if err := s.dispatchTask(ctx, task); err != nil {
 			s.logger.Warn("task failed", "task_id", task.ID, "type", task.Type, "error", err)
 		}
@@ -369,6 +357,8 @@ func (s *Sentinel) pollOnce(ctx context.Context) error {
 func (s *Sentinel) applyConfig(cfg transport.SentinelConfig) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.reconcileSweepConfig(cfg)
+	s.scanner.SetGentle(cfg.GentleScan)
 	s.scanConfig = cfg
 	s.hasConfig = true
 }
@@ -388,6 +378,8 @@ func (s *Sentinel) dispatchTask(ctx context.Context, task transport.TaskResponse
 		return s.runLocalScan(ctx, task)
 	case commonsentinel.TaskTypeKubernetesScan:
 		return s.runKubernetesScan(ctx, task)
+	case commonsentinel.TaskTypeDNSZoneTransfer:
+		return s.runDNSZoneTransfer(ctx, task)
 	default:
 		s.logger.Warn("unknown task type, dropped", "type", task.Type, "task_id", task.ID)
 		return nil
@@ -485,6 +477,73 @@ func (s *Sentinel) runKubernetesScan(ctx context.Context, task transport.TaskRes
 		return nil
 	}
 	s.triggerKubernetesScan(ctx, task.ID)
+	return nil
+}
+
+// dnsZoneTransferTimeout bounds all the transfers of one task. They run in the
+// poll loop, and a long silence would show the sentinel offline after 7 minutes.
+const dnsZoneTransferTimeout = 5 * time.Minute
+
+// Caps mirroring the backend contract: it never sends more zones or addresses.
+const (
+	maxDNSZonesPerTask     = 16
+	maxTLSAddressesPerTask = 10000
+)
+
+// runDNSZoneTransfer executes a dns_zone_transfer task: report this host's
+// resolver settings, transfer each zone of the payload and keep only the names
+// pointing to an address of the payload. The zones, servers and addresses all
+// come from the backend, so the task is refused locally when either
+// AllowDNSZoneTransfer or AllowNetworkScan is false: the names it yields are
+// only ever used by network scans.
+func (s *Sentinel) runDNSZoneTransfer(ctx context.Context, task transport.TaskResponse) error {
+	if !*s.cfg.AllowDNSZoneTransfer || !*s.cfg.AllowNetworkScan {
+		// Refused locally - no report (see runNetworkScan).
+		s.logger.Warn("dns_zone_transfer rejected: zone transfers or network scanning are disabled locally", "task_id", task.ID)
+		return nil
+	}
+	var p commonsentinel.DNSZoneTransferPayload
+	if len(task.Payload) > 0 {
+		if err := json.Unmarshal(task.Payload, &p); err != nil {
+			s.reportTask(ctx, task.ID, commonsentinel.ReportStatusFailed)
+			return fmt.Errorf("decode dns_zone_transfer payload: %w", err)
+		}
+	}
+	if len(p.Zones) > maxDNSZonesPerTask {
+		p.Zones = p.Zones[:maxDNSZonesPerTask]
+	}
+	if len(p.TLSAddresses) > maxTLSAddressesPerTask {
+		p.TLSAddresses = p.TLSAddresses[:maxTLSAddressesPerTask]
+	}
+	tlsAddrs := make(map[netip.Addr]bool, len(p.TLSAddresses))
+	for _, a := range p.TLSAddresses {
+		if addr, err := netip.ParseAddr(a); err == nil {
+			tlsAddrs[addr.Unmap()] = true
+		}
+	}
+
+	resolver := dnszone.ReadResolver()
+	report := &transport.ReportRequest{
+		TaskID:      task.ID,
+		Status:      commonsentinel.ReportStatusCompleted,
+		DNSResolver: &resolver,
+	}
+	transferCtx, cancel := context.WithTimeout(ctx, dnsZoneTransferTimeout)
+	defer cancel()
+	for _, zone := range p.Zones {
+		if transferCtx.Err() != nil {
+			// Zones never attempted are left out rather than reported as
+			// unreachable; they stay "waiting" in NoCert until the next task.
+			break
+		}
+		res := dnszone.Transfer(transferCtx, zone, tlsAddrs)
+		s.logger.Info("dns zone transfer", "task_id", task.ID, "zone", zone.Name, "server", zone.Server,
+			"status", res.Status, "records", res.Records, "hostnames", len(res.Hostnames))
+		report.DNSZones = append(report.DNSZones, res)
+	}
+	if err := s.client.PostReport(ctx, report); err != nil {
+		s.logger.Error("failed to push dns zone report", "task_id", task.ID, "error", err)
+	}
 	return nil
 }
 
@@ -637,7 +696,12 @@ func localScanCompletionReport(taskID string, keys map[string]commonsentinel.Loc
 // When local is true the observations are carried in the LocalObservations
 // slice instead (local_scan task). The probe-output shape is identical; only
 // the report slice differs.
-func (s *Sentinel) collectAndPushNetwork(ctx context.Context, resultCh <-chan scanner.ProbeOutput, taskID string, meta *scanner.ScanMeta, local, localEnumerationComplete bool) {
+func (s *Sentinel) collectAndPushNetwork(ctx context.Context, resultCh <-chan scanner.ProbeOutput, taskID string, meta *scanner.ScanMeta, local, localEnumerationComplete bool) bool {
+	targeted := !local && !meta.More
+	postReport := s.client.PostReport
+	if targeted {
+		postReport = s.postTargetedReport
+	}
 	scanTaskID := taskID
 	if scanTaskID == "" {
 		scanTaskID = meta.ScanID
@@ -666,9 +730,9 @@ func (s *Sentinel) collectAndPushNetwork(ctx context.Context, resultCh <-chan sc
 	timer := time.NewTimer(bt)
 	defer timer.Stop()
 
-	pushBatch := func() {
+	pushBatch := func() bool {
 		if len(batchObservations) == 0 && len(batchCerts) == 0 {
-			return
+			return true
 		}
 
 		report := &transport.ReportRequest{
@@ -682,14 +746,18 @@ func (s *Sentinel) collectAndPushNetwork(ctx context.Context, resultCh <-chan sc
 			report.NetworkObservations = batchObservations
 		}
 
-		if err := s.client.PostReport(ctx, report); err != nil {
+		if err := postReport(ctx, report); err != nil {
 			s.logger.Error("failed to push batch", "error", err, "observations", len(batchObservations), "certs", len(batchCerts))
 			allBatchesAccepted = false
+			if targeted {
+				return false
+			}
 		} else {
 			s.logger.Debug("pushed batch", "observations", len(batchObservations), "certs", len(batchCerts))
 		}
 
 		resetBatch()
+		return true
 	}
 
 	observationCount := 0
@@ -698,7 +766,12 @@ func (s *Sentinel) collectAndPushNetwork(ctx context.Context, resultCh <-chan sc
 		select {
 		case out, ok := <-resultCh:
 			if !ok {
-				pushBatch()
+				if !pushBatch() {
+					return false
+				}
+				if meta.More {
+					return allBatchesAccepted && ctx.Err() == nil
+				}
 
 				report := &transport.ReportRequest{TaskID: scanTaskID, Status: commonsentinel.ReportStatusCompleted}
 				if local {
@@ -708,8 +781,12 @@ func (s *Sentinel) collectAndPushNetwork(ctx context.Context, resultCh <-chan sc
 						allBatchesAccepted && localEnumerationComplete && ctx.Err() == nil,
 					)
 				}
-				if err := s.client.PostReport(ctx, report); err != nil {
+				if err := postReport(ctx, report); err != nil {
 					s.logger.Error("failed to send scan completion", "error", err)
+					allBatchesAccepted = false
+					if targeted {
+						return false
+					}
 				}
 
 				scanType := "network"
@@ -722,14 +799,14 @@ func (s *Sentinel) collectAndPushNetwork(ctx context.Context, resultCh <-chan sc
 					"observations", observationCount,
 					"duration", time.Since(meta.StartedAt),
 				)
-				return
+				return allBatchesAccepted && ctx.Err() == nil
 			}
 
 			fps := make([]string, 0, len(out.Chain))
 			for _, der := range out.Chain {
 				fps = append(fps, scanner.Fingerprint(der))
 			}
-			if len(fps) == 0 {
+			if len(fps) == 0 && (out.TLS == nil || out.TLS.TLSVersionID == nil) {
 				continue
 			}
 
@@ -750,10 +827,15 @@ func (s *Sentinel) collectAndPushNetwork(ctx context.Context, resultCh <-chan sc
 			if outputBytes > maxNetworkBatchBytes {
 				s.logger.Error("probe output exceeds report budget", "task_id", scanTaskID)
 				allBatchesAccepted = false
+				if targeted {
+					return false
+				}
 				continue
 			}
 			if batchBytes+outputBytes > maxNetworkBatchBytes {
-				pushBatch()
+				if !pushBatch() {
+					return false
+				}
 			}
 			for i, der := range out.Chain {
 				fp := fps[i]
@@ -771,7 +853,9 @@ func (s *Sentinel) collectAndPushNetwork(ctx context.Context, resultCh <-chan sc
 			observationCount++
 
 			if len(batchObservations) >= batchSize {
-				pushBatch()
+				if !pushBatch() {
+					return false
+				}
 				if !timer.Stop() {
 					select {
 					case <-timer.C:
@@ -791,12 +875,14 @@ func (s *Sentinel) collectAndPushNetwork(ctx context.Context, resultCh <-chan sc
 				// middleware, before the backend even parses the body.
 				s.sendHeartbeat(ctx, scanTaskID)
 			} else {
-				pushBatch()
+				if !pushBatch() {
+					return false
+				}
 			}
 			timer.Reset(bt)
 
 		case <-ctx.Done():
-			return
+			return false
 		}
 	}
 }
@@ -829,7 +915,7 @@ const (
 	localScanTimeout = 2 * time.Second
 )
 
-// triggerScan runs a full CIDR sweep with the supplied ranges and ports.
+// triggerScan queues a full CIDR sweep with the supplied ranges and ports.
 // Concurrent scans are coalesced via s.scanning.
 func (s *Sentinel) triggerScan(ctx context.Context, taskID string, ipRanges []string, ports []int) {
 	if !*s.cfg.AllowNetworkScan {
@@ -845,14 +931,7 @@ func (s *Sentinel) triggerScan(ctx context.Context, taskID string, ipRanges []st
 	}
 	defer s.scanning.Store(false)
 
-	cfg := scanner.ScanConfig{
-		IPRanges: ipRanges,
-		Ports:    ports,
-		Timeout:  defaultScanTimeout,
-	}
-
-	resultCh, meta := s.scanner.ScanStream(ctx, cfg)
-	s.collectAndPushNetwork(ctx, resultCh, taskID, meta, false, false)
+	s.queueNetworkSweep(ctx, taskID, ipRanges, ports)
 }
 
 // triggerHostnameScan runs a single-target scan against an FQDN. The
@@ -873,7 +952,13 @@ func (s *Sentinel) triggerHostnameScan(ctx context.Context, taskID, fqdn string,
 	}
 	defer s.scanning.Store(false)
 
-	resultCh, meta := s.scanner.ScanHostname(ctx, fqdn, ports, defaultScanTimeout, deepEnum)
+	scanCtx, cancel := context.WithCancel(ctx)
+	resultCh, meta := s.scanner.ScanHostname(scanCtx, fqdn, ports, defaultScanTimeout, deepEnum)
+	defer func() {
+		cancel()
+		for range resultCh {
+		}
+	}()
 	s.collectAndPushNetwork(ctx, resultCh, taskID, meta, false, false)
 }
 
@@ -900,7 +985,13 @@ func (s *Sentinel) triggerTargetedScan(ctx context.Context, taskID string, specs
 		targets = append(targets, scanner.Target{Host: spec.IP, Port: spec.Port, ServerName: spec.SNI})
 	}
 
-	resultCh, meta := s.scanner.ScanTargets(ctx, targets, defaultScanTimeout)
+	scanCtx, cancel := context.WithCancel(ctx)
+	resultCh, meta := s.scanner.ScanTargets(scanCtx, targets, defaultScanTimeout)
+	defer func() {
+		cancel()
+		for range resultCh {
+		}
+	}()
 	s.collectAndPushNetwork(ctx, resultCh, taskID, meta, false, false)
 }
 
@@ -977,64 +1068,4 @@ func (s *Sentinel) triggerFilesystemScan(ctx context.Context, taskID string) {
 		"certs", len(result.Observations),
 		"complete", result.Complete,
 		"duration", time.Since(start))
-}
-
-// keyRotationLoop checks periodically if the key needs rotation.
-func (s *Sentinel) keyRotationLoop(ctx context.Context) error {
-	ticker := time.NewTicker(s.cfg.KeyRotationCheckInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-ticker.C:
-			s.checkKeyRotation(ctx)
-		}
-	}
-}
-
-func (s *Sentinel) checkKeyRotation(ctx context.Context) {
-	kf, err := s.store.Load()
-	if err != nil {
-		s.logger.Error("failed to load key file for rotation check", "error", err)
-		return
-	}
-
-	if !kf.NeedsRotation(s.cfg.KeyRotationMargin) {
-		return
-	}
-
-	s.logger.Info("key rotation needed", "expires_at", kf.KeyExpiresAt)
-
-	newPrivB64, newPubB64, err := keystore.GenerateKeyPair()
-	if err != nil {
-		s.logger.Error("failed to generate new key pair", "error", err)
-		return
-	}
-
-	resp, err := s.client.RotateKey(ctx, newPubB64)
-	if err != nil {
-		s.logger.Error("key rotation request failed", "error", err)
-		return
-	}
-
-	kf.PrivateKey = newPrivB64
-	kf.PublicKey = newPubB64
-	kf.KeyID = resp.KeyID
-	kf.KeyExpiresAt = resp.KeyExpiresAt
-
-	if err := s.store.Save(kf); err != nil {
-		s.logger.Error("failed to save rotated key file", "error", err)
-		return
-	}
-
-	newPriv, err := kf.PrivateKeyBytes()
-	if err != nil {
-		s.logger.Error("failed to decode new private key", "error", err)
-		return
-	}
-	s.client.UpdateCredentials(resp.KeyID, newPriv)
-
-	s.logger.Info("key rotation successful", "new_key_id", resp.KeyID, "expires_at", resp.KeyExpiresAt)
 }

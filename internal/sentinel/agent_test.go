@@ -122,7 +122,8 @@ func newTestSentinelWithClient(t *testing.T, srv *httptest.Server, allowScan boo
 
 func newTestSentinel(allowScan bool) *Sentinel {
 	return &Sentinel{
-		logger: slog.Default(),
+		scanner: scanner.New(slog.Default()),
+		logger:  slog.Default(),
 		cfg: &config.Config{
 			ServerURL:           "https://example.com",
 			AllowNetworkScan:    boolPtr(allowScan),

@@ -10,6 +10,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"nocert.io/sentinel/internal/scanner"
+	"nocert.io/sentinel/internal/transport"
 )
 
 func TestNetworkBatchesStayWithinBodyLimit(t *testing.T) {
@@ -55,4 +56,23 @@ func TestNetworkBatchesStayWithinBodyLimit(t *testing.T) {
 			require.Greater(t, len(rr.reports), 2)
 		})
 	}
+}
+
+func TestNetworkBatchRetainsProtocolWithoutCertificate(t *testing.T) {
+	rr := &reportRecorder{accept: true}
+	s := newTestSentinelWithClient(t, rr.server(t), true)
+	version := uint16(0x0300)
+	incomplete := false
+	outputs := make(chan scanner.ProbeOutput, 1)
+	outputs <- scanner.ProbeOutput{IP: "192.0.2.1", Port: 443, TLS: &transport.TLSObservation{TLSVersionID: &version, HandshakeComplete: &incomplete}}
+	close(outputs)
+	s.collectAndPushNetwork(context.Background(), outputs, "task", &scanner.ScanMeta{StartedAt: time.Now()}, false, true)
+	var observations []transport.SentinelNetworkObservation
+	for _, report := range rr.reports {
+		require.Empty(t, report.Certificates)
+		observations = append(observations, report.NetworkObservations...)
+	}
+	require.Len(t, observations, 1)
+	require.Empty(t, observations[0].ObservedChainFingerprints)
+	require.Equal(t, version, *observations[0].TLS.TLSVersionID)
 }

@@ -1,8 +1,7 @@
-// Package tlsenum performs hand-crafted TLS cipher suite enumeration against
-// a target host. It probes TLS 1.0, 1.1, and 1.2 per cipher (TLS 1.3 is out of
-// scope - see spec 2026-05-05-tls-cipher-enumeration-design.md). Zero external
-// dependencies beyond the Go standard library and nocert.io/common/pkg/{tlsconst,
-// tlsprobe}.
+// Package tlsenum probes ServerHello cipher selection in TLS 1.0, 1.1 and 1.2.
+// A completed run covers only tlsconst.EnumerationProfile: no credentials,
+// TLS 1.3 enumeration, or exhaustive signature/group configurations. Selection
+// does not attest a completed or authenticated handshake.
 package tlsenum
 
 import (
@@ -44,12 +43,17 @@ type Result struct {
 
 // CipherFinding describes one (version, cipher) pair the server accepted.
 type CipherFinding struct {
-	Version string // "TLSv1.0", "TLSv1.1", "TLSv1.2"
-	Cipher  string // IANA name from tlsconst registry
+	DHBits    uint16
+	VersionID uint16
+	CipherID  uint16
+	Version   string // "TLSv1.0", "TLSv1.1", "TLSv1.2"
+	Cipher    string // IANA name from tlsconst registry
 }
 
 // Options controls dialing and timeouts. Dialer is REQUIRED.
 type Options struct {
+	// DisableALPN omits HTTP protocol offers for non-HTTP discovery.
+	DisableALPN      bool
 	Dialer           tlsprobe.ContextDialer
 	HandshakeTimeout time.Duration // per attempt; default 3s if zero
 }
@@ -59,33 +63,29 @@ const (
 	defaultHandshakeTimeout = 3 * time.Second
 )
 
-// targetCiphers is the union of every non-TLS-1.3 cipher in the tlsconst
-// registry, used as the offer list for TLS 1.0/1.1/1.2 enumeration.
-var targetCiphers []uint16
+// targetCiphers is a deterministic union of the TLS 1.0-1.2 probe catalogue.
+var targetCiphers = ciphersForVersion(versionTLS12)
 
-func init() {
+func ciphersForVersion(version uint16) []uint16 {
+	var ids []uint16
 	for _, c := range tlsconst.AllCiphers() {
-		// Exclude the whole TLS 1.3 suite range (0x13xx: AES-GCM, ChaCha20,
-		// CCM, CCM_8) - they are meaningless in a ≤1.2 ClientHello. An ID
-		// list would silently start offering any newly-registered 1.3 suite.
-		if c.ID&0xFF00 == 0x1300 {
-			continue
+		if c.SupportsVersion(version) {
+			ids = append(ids, c.ID)
 		}
-		targetCiphers = append(targetCiphers, c.ID)
 	}
-	if len(targetCiphers) > maxTargetCiphers {
-		panic(fmt.Sprintf("tlsenum: target cipher list size %d exceeds cap %d",
-			len(targetCiphers), maxTargetCiphers))
+	if len(ids) > maxTargetCiphers {
+		panic("tlsenum: cipher catalogue exceeds cap")
 	}
+	return ids
 }
 
 // Enumerate probes the target across TLS 1.0, 1.1, and 1.2 using the
 // remove-and-retry loop (see enumVersion), aggregating findings in
-// server-preference order per version.
+// selection order (which can follow client preference) per version.
 //
 // A nil error means every version reached a clean terminal. Errors on one
 // version do not prevent probing the others, but the aggregate remains partial.
-// Callers must not replace complete evidence or stamp freshness on an error.
+// Callers must not mark partial findings as complete or fresh.
 // Pass a context deadline to bound the entire enumeration.
 func Enumerate(ctx context.Context, host string, port int, opts Options) (*Result, error) {
 	if opts.Dialer == nil {
@@ -104,7 +104,7 @@ func Enumerate(ctx context.Context, host string, port int, opts Options) (*Resul
 		if err := ctx.Err(); err != nil {
 			return res, err
 		}
-		findings, ip, err := enumVersion(ctx, opts.Dialer, host, port, ver, targetCiphers, per)
+		findings, ip, err := enumVersion(ctx, opts.Dialer, host, port, ver, ciphersForVersion(ver), per, opts.DisableALPN)
 		if res.PeerIP == "" && ip != "" {
 			res.PeerIP = ip
 		}
@@ -132,6 +132,10 @@ func Enumerate(ctx context.Context, host string, port int, opts Options) (*Resul
 // Callers must pass serverName <= 255 bytes and len(ciphers) <= 256; both hold
 // via Enumerate's validation and the package-init cap on targetCiphers.
 func buildClientHello(serverName string, innerVersion uint16, ciphers []uint16, random [32]byte) []byte {
+	return buildClientHelloProfile(serverName, innerVersion, ciphers, random, true, false)
+}
+
+func buildClientHelloProfile(serverName string, innerVersion uint16, ciphers []uint16, random [32]byte, extensions, disableALPN bool) []byte {
 	body := make([]byte, 0, 256)
 	body = append(body, byte(innerVersion>>8), byte(innerVersion))
 	body = append(body, random[:]...)
@@ -143,18 +147,22 @@ func buildClientHello(serverName string, innerVersion uint16, ciphers []uint16, 
 	}
 	body = append(body, 0x01, 0x00) // compression_methods: null
 
-	extBuf := make([]byte, 0, 128)
-	if serverName != "" {
-		extBuf = append(extBuf, buildSNIExtension(serverName)...)
+	if extensions {
+		extBuf := make([]byte, 0, 128)
+		if serverName != "" && net.ParseIP(serverName) == nil {
+			extBuf = append(extBuf, buildSNIExtension(serverName)...)
+		}
+		extBuf = append(extBuf, buildSupportedGroupsExtension()...)
+		extBuf = append(extBuf, buildECPointFormatsExtension()...)
+		if innerVersion == versionTLS12 {
+			extBuf = append(extBuf, buildSignatureAlgorithmsExtension()...)
+		}
+		if !disableALPN {
+			extBuf = append(extBuf, buildALPNExtension()...)
+		}
+		body = appendU16(body, uint16(len(extBuf)))
+		body = append(body, extBuf...)
 	}
-	extBuf = append(extBuf, buildSupportedGroupsExtension()...)
-	extBuf = append(extBuf, buildECPointFormatsExtension()...)
-	if innerVersion == versionTLS12 {
-		extBuf = append(extBuf, buildSignatureAlgorithmsExtension()...)
-	}
-	extBuf = append(extBuf, buildALPNExtension()...)
-	body = appendU16(body, uint16(len(extBuf)))
-	body = append(body, extBuf...)
 
 	hs := make([]byte, 0, len(body)+4)
 	hs = append(hs, 0x01) // ClientHello
@@ -163,7 +171,11 @@ func buildClientHello(serverName string, innerVersion uint16, ciphers []uint16, 
 	hs = append(hs, body...)
 
 	rec := make([]byte, 0, len(hs)+5)
-	rec = append(rec, 0x16, 0x03, 0x01)
+	recordVersion := uint16(versionTLS10)
+	if innerVersion == versionSSL30 {
+		recordVersion = versionSSL30
+	}
+	rec = append(rec, 0x16, byte(recordVersion>>8), byte(recordVersion))
 	rec = appendU16(rec, uint16(len(hs)))
 	rec = append(rec, hs...)
 	return rec
@@ -202,16 +214,15 @@ func buildECPointFormatsExtension() []byte {
 }
 
 func buildSignatureAlgorithmsExtension() []byte {
-	// Advertise what a modern client offers so a server whose cert needs a
-	// signature scheme we didn't list (ECDSA-P521, Ed25519, RSA-PSS) doesn't
-	// answer handshake_failure - which enumVersion would misread as "no more
-	// ciphers" and record an authoritative-looking empty result. Extra schemes
-	// never hurt: the server picks whichever one its cert can use.
+	// This offer is part of tls-cert-v1. Signature support can affect whether
+	// a server accepts a suite, so changes require a new enumeration profile.
 	algs := []uint16{
 		0x0403, 0x0503, 0x0603, // ecdsa_secp{256r1,384r1,521r1}_sha{256,384,512}
 		0x0804, 0x0805, 0x0806, // rsa_pss_rsae_sha{256,384,512}
 		0x0401, 0x0501, 0x0601, // rsa_pkcs1_sha{256,384,512}
-		0x0807, // ed25519
+		0x0807, 0x0808, // ed25519, ed448
+		0x0809, 0x080A, 0x080B, // rsa_pss_pss_sha{256,384,512}
+		0x0203, 0x0202, 0x0402, // legacy ECDSA-SHA1, DSA-SHA1/SHA256
 		0x0201, // rsa_pkcs1_sha1 (legacy TLS 1.0/1.1 servers)
 	}
 	inner := make([]byte, 0, 2+2*len(algs))
@@ -311,15 +322,12 @@ const (
 // classifyAlert maps a TLS alert record fragment ([level, description]) to an
 // enumeration outcome. Only "no acceptable parameters" alerts are a CLEAN
 // terminal; any other alert is an ERROR, so a truncated cipher list is never
-// recorded as the server's complete offer.
+// recorded as a completed catalogue probe.
 //
-// The alert LEVEL is deliberately NOT used to decide severity: Go's crypto/tls
-// sends essentially every alert at fatal level (including a benign
-// unrecognized_name when the SNI doesn't match a vhost - which our own CIDR
-// sweeps provoke by sending an IP literal as SNI), so "fatal" says nothing about
-// whether the peer is broken.
+// These descriptions are fatal in TLS 1.0-1.2. Other levels and malformed
+// fragments cannot establish a clean terminal.
 func classifyAlert(frag []byte) (cipher uint16, version uint16, alert bool, err error) {
-	if len(frag) < 2 {
+	if len(frag) != 2 || frag[0] != 2 {
 		return 0, 0, false, fmt.Errorf("truncated alert record (%d bytes)", len(frag))
 	}
 	switch desc := frag[1]; desc {
@@ -336,6 +344,9 @@ func readRecord(r io.Reader) (recType byte, frag []byte, err error) {
 	header := make([]byte, 5)
 	if _, err := io.ReadFull(r, header); err != nil {
 		return 0, nil, fmt.Errorf("read record header: %w", err)
+	}
+	if header[1] != 3 || header[2] > 3 {
+		return 0, nil, fmt.Errorf("invalid record version")
 	}
 	fragLen := int(binary.BigEndian.Uint16(header[3:5]))
 	if fragLen == 0 || fragLen > maxResponseBytes-5 {
@@ -364,6 +375,10 @@ func handshakeMessageComplete(frag []byte) bool {
 // concatenated handshake messages or attacker padding cannot make us read past
 // the ServerHello body.
 func parseServerHelloBody(frag []byte) (cipher uint16, version uint16, err error) {
+	return parseServerHello(frag, versionTLS10)
+}
+
+func parseServerHello(frag []byte, minVersion uint16) (cipher uint16, version uint16, err error) {
 	if len(frag) < 4 {
 		return 0, 0, fmt.Errorf("handshake header truncated")
 	}
@@ -388,11 +403,46 @@ func parseServerHelloBody(frag []byte) (cipher uint16, version uint16, err error
 		return 0, 0, fmt.Errorf("session_id_length %d exceeds RFC limit", sidLen)
 	}
 	off++
-	if off+sidLen+2 > len(body) {
+	if off+sidLen+3 > len(body) {
 		return 0, 0, fmt.Errorf("session_id or cipher_suite truncated")
 	}
 	off += sidLen
 	cipher = binary.BigEndian.Uint16(body[off : off+2])
+	off += 2
+	if body[off] != 0 {
+		return 0, 0, fmt.Errorf("unoffered compression method")
+	}
+	off++
+	if version < minVersion || version > versionTLS12 {
+		return 0, 0, fmt.Errorf("invalid ServerHello version")
+	}
+	if off == len(body) {
+		return cipher, version, nil
+	} // extensions are optional
+	if len(body)-off < 2 || int(binary.BigEndian.Uint16(body[off:off+2])) != len(body)-off-2 {
+		return 0, 0, fmt.Errorf("invalid extensions length")
+	}
+	off += 2
+	seen := make(map[uint16]bool)
+	for off < len(body) {
+		if len(body)-off < 4 {
+			return 0, 0, fmt.Errorf("truncated extension")
+		}
+		typ := binary.BigEndian.Uint16(body[off : off+2])
+		size := int(binary.BigEndian.Uint16(body[off+2 : off+4]))
+		off += 4
+		if seen[typ] || size > len(body)-off {
+			return 0, 0, fmt.Errorf("duplicate or truncated extension")
+		}
+		seen[typ] = true
+		// Only extensions offered by this ClientHello may appear in ServerHello.
+		switch typ {
+		case 0, 10, 11, 16:
+		default:
+			return 0, 0, fmt.Errorf("unoffered extension 0x%04X", typ)
+		}
+		off += size
+	}
 	return cipher, version, nil
 }
 
@@ -403,7 +453,7 @@ func parseServerHelloBody(frag []byte) (cipher uint16, version uint16, err error
 // perAttempt, so a target that stalls at any stage cannot pin the caller for
 // longer than that.
 func attemptHandshake(ctx context.Context, dialer tlsprobe.ContextDialer, host string, port int,
-	innerVersion uint16, ciphers []uint16, perAttempt time.Duration) (cipher uint16, version uint16, alert bool, peerIP string, err error) {
+	innerVersion uint16, ciphers []uint16, perAttempt time.Duration, disableALPN bool) (cipher uint16, version uint16, alert bool, peerIP string, err error) {
 
 	conn, err := tlsprobe.DialContext(ctx, dialer, "tcp", net.JoinHostPort(host, strconv.Itoa(port)), perAttempt)
 	if err != nil {
@@ -425,7 +475,7 @@ func attemptHandshake(ctx context.Context, dialer tlsprobe.ContextDialer, host s
 	if _, err := cryptorand.Read(random[:]); err != nil {
 		return 0, 0, false, peerIP, fmt.Errorf("rand: %w", err)
 	}
-	hello := buildClientHello(host, innerVersion, ciphers, random)
+	hello := buildClientHelloProfile(host, innerVersion, ciphers, random, true, disableALPN)
 	if _, err := conn.Write(hello); err != nil {
 		return 0, 0, false, peerIP, fmt.Errorf("write ClientHello: %w", err)
 	}
@@ -443,7 +493,7 @@ var versionLabel = map[uint16]string{
 }
 
 // enumVersion runs the remove-and-retry enumeration loop for one TLS version.
-// Returns findings (in server-preference order), the first non-empty peer IP
+// Returns findings (in selection order (which can follow client preference)), the first non-empty peer IP
 // captured during the loop, and an error.
 //
 // A nil error is a clean terminal: either the version's ciphers were exhausted,
@@ -452,7 +502,7 @@ var versionLabel = map[uint16]string{
 // a malformed response, an unreachable dial, or context cancellation stopped
 // the loop before a clean terminal - the findings are then partial.
 func enumVersion(ctx context.Context, dialer tlsprobe.ContextDialer, host string, port int,
-	innerVersion uint16, target []uint16, perAttempt time.Duration) ([]CipherFinding, string, error) {
+	innerVersion uint16, target []uint16, perAttempt time.Duration, disableALPN bool) ([]CipherFinding, string, error) {
 
 	// Copy the input so we never mutate the caller's slice (targetCiphers is
 	// shared package state).
@@ -464,7 +514,7 @@ func enumVersion(ctx context.Context, dialer tlsprobe.ContextDialer, host string
 		if err := ctx.Err(); err != nil {
 			return found, peerIP, err
 		}
-		cipher, version, alert, ip, err := attemptHandshake(ctx, dialer, host, port, innerVersion, remaining, perAttempt)
+		cipher, version, alert, ip, err := attemptHandshake(ctx, dialer, host, port, innerVersion, remaining, perAttempt, disableALPN)
 		if peerIP == "" && ip != "" {
 			peerIP = ip
 		}
@@ -479,16 +529,10 @@ func enumVersion(ctx context.Context, dialer tlsprobe.ContextDialer, host string
 			// version's enumeration. Clean, not an error.
 			break
 		}
-		if version != innerVersion {
-			// The server negotiated a DIFFERENT version than we offered - a
-			// pre-1.3 server whose max is below innerVersion downgrades (answers
-			// with a lower ServerHello version instead of an alert), and a
-			// misbehaving server could claim a higher one. Either way it does not
-			// actually negotiate innerVersion, so stop enumerating this version
-			// (a clean terminal) rather than recording a phantom finding here.
-			// The version the server DID negotiate is enumerated on its own pass.
-			break
+		if version > innerVersion {
+			return found, peerIP, fmt.Errorf("server selected a higher version")
 		}
+
 		match := false
 		for _, x := range remaining {
 			if x == cipher {
@@ -497,11 +541,34 @@ func enumVersion(ctx context.Context, dialer tlsprobe.ContextDialer, host string
 			}
 		}
 		if !match {
-			break // server picked a cipher we didn't offer - stop for this version
+			return found, peerIP, fmt.Errorf("server selected an unoffered cipher 0x%04X", cipher)
+		}
+		if !tlsconst.LookupCipher(cipher).SupportsVersion(version) {
+			return found, peerIP, fmt.Errorf("cipher incompatible with version")
+		}
+		if version < innerVersion {
+			break
+		} // valid downgrade; measured on its own pass
+		var dhBits uint16
+		if dhe, _ := tlsconst.FiniteFieldDHE(cipher); dhe {
+			peerDialer := dialer
+			if ip != "" {
+				pinned, err := tlsprobe.NewPinnedDialer(dialer, ip)
+				if err != nil {
+					return found, peerIP, err
+				}
+				peerDialer = pinned
+			}
+			flight, _ := collectOnce(ctx, host, port, host, collectionProfile{innerVersion, true}, []uint16{cipher}, Options{Dialer: peerDialer, HandshakeTimeout: perAttempt})
+			if flight != nil && flight.Version == innerVersion && flight.Cipher == cipher {
+				dhBits = uint16(flight.DHBits)
+			}
 		}
 		found = append(found, CipherFinding{
-			Version: versionLabel[innerVersion],
-			Cipher:  tlsconst.CipherName(cipher),
+			DHBits:    dhBits,
+			Version:   versionLabel[innerVersion],
+			VersionID: innerVersion, CipherID: cipher,
+			Cipher: tlsconst.CipherName(cipher),
 		})
 		remaining = removeCipher(remaining, cipher)
 	}

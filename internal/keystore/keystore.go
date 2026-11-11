@@ -29,11 +29,8 @@ type KeyFile struct {
 	// response signatures. Captured at registration from the
 	// signing_key_id field of the /register response.
 	SigningKeyID string `json:"signing_key_id"`
-	// MachineID pins this key to the host that enrolled it: /etc/machine-id
-	// (falling back to /var/lib/dbus/machine-id) captured at registration. If a
-	// key file is cloned into a VM template and the template is deployed, the
-	// clone's machine-id differs -> the agent discards the foreign key and
-	// re-enrolls as itself, instead of impersonating the origin host.
+	// MachineID detects a copied identity only when the host ID changes.
+	// Templates must not contain an enrolled key, even if machine-id is reset.
 	MachineID string `json:"machine_id,omitempty"`
 }
 

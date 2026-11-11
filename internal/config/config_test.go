@@ -282,3 +282,17 @@ func TestAllowKubernetesScanDefaultsTrue(t *testing.T) {
 	require.NotNil(t, cfg.AllowKubernetesScan)
 	assert.True(t, *cfg.AllowKubernetesScan)
 }
+
+func TestAllowDNSZoneTransferDefaultsTrueAndCanBeRefused(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(p, []byte("server_url: https://backend.example\n"), 0o600))
+	cfg, err := Load(p)
+	require.NoError(t, err)
+	require.NotNil(t, cfg.AllowDNSZoneTransfer)
+	assert.True(t, *cfg.AllowDNSZoneTransfer)
+
+	require.NoError(t, os.WriteFile(p, []byte("server_url: https://backend.example\nallow_dns_zone_transfer: false\n"), 0o600))
+	cfg, err = Load(p)
+	require.NoError(t, err)
+	assert.False(t, *cfg.AllowDNSZoneTransfer)
+}

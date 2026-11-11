@@ -25,6 +25,72 @@ type closeTrackingBody struct {
 	closed bool
 }
 
+func TestRotateKeyResponseValidation(t *testing.T) {
+	valid, err := json.Marshal(RotateResponse{KeyID: "rotated-key", KeyExpiresAt: time.Now().Add(30 * 24 * time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+		signed bool
+		ok     bool
+	}{
+		{"valid", 200, string(valid), true, true},
+		{"unsigned success", 200, string(valid), false, false},
+		{"invalid JSON", 200, "untrusted diagnostic", true, false},
+		{"missing identity", 200, `{}`, true, false},
+		{"expired key", 200, `{"key_id":"key","key_expires_at":"2000-01-01T00:00:00Z"}`, true, false},
+		{"rejected", 403, "untrusted diagnostic", false, false},
+		{"throttled", 429, "untrusted diagnostic", false, false},
+		{"unavailable", 503, strings.Repeat("untrusted diagnostic", 10000), false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newReportClient(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Retry-After", "120")
+				if tc.signed {
+					details, err := httpsig.RequestDetails(r)
+					if err != nil {
+						t.Error(err)
+						w.WriteHeader(400)
+						return
+					}
+					key := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{0x22}, ed25519.SeedSize))
+					digest, input, signature := httpsig.SignResponse(tc.status, []byte(tc.body), details.Nonce, key, "server-1")
+					w.Header().Set("Content-Digest", digest)
+					w.Header().Set("Signature-Input", input)
+					w.Header().Set("Signature", signature)
+				}
+				w.WriteHeader(tc.status)
+				_, _ = io.WriteString(w, tc.body)
+			})
+			result, err := c.RotateKey(t.Context(), "fixture-public-key")
+			if tc.ok {
+				if err != nil || result.KeyID != "rotated-key" {
+					t.Fatalf("valid rotation failed: %v", err)
+				}
+				return
+			}
+			if err == nil || result != nil {
+				t.Fatal("invalid response accepted")
+			}
+			if strings.Contains(err.Error(), "untrusted diagnostic") || len(err.Error()) > 256 {
+				t.Fatal("rotation error contains response content")
+			}
+			if tc.status >= 400 {
+				var status *HTTPError
+				if !errors.As(err, &status) || status.StatusCode != tc.status {
+					t.Fatalf("missing structured HTTP status: %v", err)
+				}
+				if (tc.status == 429 || tc.status == 503) && status.RetryAfter != 120*time.Second {
+					t.Fatal("lost Retry-After")
+				}
+			}
+		})
+	}
+}
+
 func (b *closeTrackingBody) Close() error {
 	b.closed = true
 	return b.ReadCloser.Close()
@@ -213,7 +279,7 @@ func TestBackendTransportRejectsUntrustedCertificate(t *testing.T) {
 	defer srv.Close()
 	tr := sharedTransport.Clone()
 	defer tr.CloseIdleConnections()
-	client := &http.Client{Transport: tr, Timeout: time.Second}
+	client := &http.Client{Transport: tr, Timeout: 5 * time.Second}
 	resp, err := client.Get(srv.URL)
 	if resp != nil {
 		_ = resp.Body.Close()
@@ -499,6 +565,9 @@ func TestDoSigned_SendsVersionHeader(t *testing.T) {
 	var gotVersion string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotVersion = r.Header.Get("X-Sentinel-Version")
+		if got := r.Header.Get("X-Sentinel-Features"); got != "gentle-scan-v1" {
+			t.Errorf("expected gentle scan capability, got %q", got)
+		}
 
 		if err := httpsig.VerifyRequest(r, sentinelPub, sentinelKeyID, nil); err != nil {
 			t.Errorf("server verify request: %v", err)
@@ -540,8 +609,7 @@ func TestDoSigned_SendsVersionHeader(t *testing.T) {
 }
 
 // TestRegister_StatusInErrorDiscriminates4xx5xx asserts Register surfaces the
-// numeric status in its error, so the caller's retry logic (retry 5xx, give up
-// on 4xx) can key on it.
+// numeric status in a typed error, including temporary 429 responses.
 func TestRegister_StatusInErrorDiscriminates4xx5xx(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -550,6 +618,7 @@ func TestRegister_StatusInErrorDiscriminates4xx5xx(t *testing.T) {
 	}{
 		{"client error not retryable", http.StatusForbidden, "status 403"},
 		{"server error retryable", http.StatusBadGateway, "status 502"},
+		{"rate limited", http.StatusTooManyRequests, "status 429"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -565,6 +634,14 @@ func TestRegister_StatusInErrorDiscriminates4xx5xx(t *testing.T) {
 			if !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("expected error to contain %q, got: %v", tc.want, err)
 			}
+			var status *HTTPError
+			if !errors.As(err, &status) || status.StatusCode != tc.status {
+				t.Fatalf("missing typed status: %v", err)
+			}
+			if Retryable(err) != (tc.status == 429 || tc.status >= 500) {
+				t.Fatalf("wrong retry policy for %d", tc.status)
+			}
+
 		})
 	}
 }

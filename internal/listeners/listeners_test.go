@@ -25,7 +25,7 @@ const procTCPv4 = `  sl  local_address rem_address   st tx_queue rx_queue tr tm-
 `
 
 // :01BB=443, :1F90=8080, 0500000A=10.0.0.5, :0016=22 (SSH, denylisted),
-// :0019=25 (SMTP, denylisted), line 4 is st 01 (ESTABLISHED) -> skipped.
+// :0019=25 (SMTP STARTTLS), line 4 is st 01 (ESTABLISHED) -> skipped.
 
 const procTCPv6 = `  sl  local_address                         remote_address                        st ...
    0: 00000000000000000000000001000000:1F91 00000000000000000000000000000000:0000 0A 0
@@ -49,6 +49,7 @@ func TestEnumerate_DecodesAndFiltersListeners(t *testing.T) {
 	got := collect(enumerate(strings.NewReader(procTCPv4), strings.NewReader(procTCPv6)))
 
 	want := []string{
+		"127.0.0.1:25",   // SMTP STARTTLS
 		"127.0.0.1:443",  // v4 loopback 0100007F:01BB
 		"127.0.0.1:8080", // v4 wildcard 00000000:1F90 -> loopback
 		"10.0.0.5:443",   // v4 specific bind -> dialed as-is
@@ -60,12 +61,12 @@ func TestEnumerate_DecodesAndFiltersListeners(t *testing.T) {
 		}
 	}
 
-	// SSH (22) and SMTP (25) are denylisted -> never probed.
+	// SSH is still skipped; SMTP now has a bounded STARTTLS preamble.
 	if got["127.0.0.1:22"] {
 		t.Errorf("denylisted port 22 should be skipped, got %v", got)
 	}
-	if got["127.0.0.1:25"] {
-		t.Errorf("denylisted port 25 should be skipped, got %v", got)
+	if !got["127.0.0.1:25"] {
+		t.Errorf("SMTP listener missing: %v", got)
 	}
 	// ESTABLISHED socket (st 01) is not a listener.
 	if got["127.0.0.1:4444"] {

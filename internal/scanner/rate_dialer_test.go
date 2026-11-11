@@ -96,7 +96,7 @@ func TestScanEnumerationSharesConnectionBudget(t *testing.T) {
 			s := New(slog.Default())
 			started := time.Now()
 			ch, _ := s.ScanStream(ctx, ScanConfig{
-				Targets: []target{{host: "127.0.0.1", port: port}, {host: "127.0.0.1", port: port}},
+				Targets: []target{{host: "127.0.0.1", port: port, serverName: "a.example"}, {host: "127.0.0.1", port: port, serverName: "b.example"}},
 				Workers: 2, MaxConnPerSec: 10, Timeout: time.Second, DeepEnum: deep, SkipSNIReprobe: true,
 			})
 			count := 0
@@ -109,8 +109,8 @@ func TestScanEnumerationSharesConnectionBudget(t *testing.T) {
 			require.Equal(t, 2, count)
 			want := 2
 			if deep {
-				want = 8
-			} // one fast probe + three declined legacy versions per target
+				want = 12
+			} // One fast probe, three TLS versions and two obsolete protocols per target.
 			require.Len(t, arrivals, want)
 			require.GreaterOrEqual(t, time.Since(started), time.Duration(want)*100*time.Millisecond-50*time.Millisecond,
 				"enumeration workers must share the fast probes' connection budget")

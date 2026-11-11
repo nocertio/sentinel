@@ -7,9 +7,9 @@
 // service was never reloaded".
 //
 // Only LISTEN sockets (st == 0x0A) are returned, minus a denylist of well-known
-// plaintext / STARTTLS-only ports where a bare TLS ClientHello yields no
+// unsupported plaintext ports where a TLS ClientHello yields no
 // certificate and only logs noise on the host's own services. Implicit-TLS
-// ports (443, 465, 636, 853, 993, 995, 3389, 8443, ...) are kept.
+// ports and supported STARTTLS/RDP ports are kept.
 //
 // netns caveat: /proc/net/tcp only shows sockets in the reader's own network
 // namespace. A sentinel inside a container sees only that container's
@@ -42,27 +42,20 @@ const (
 	maxLocalTargets = 256
 )
 
-// denyPorts are TCP ports that are plaintext or STARTTLS BY DEFAULT, where a
+// denyPorts are TCP ports without a supported TLS preamble, where a
 // bare TLS ClientHello almost always yields no certificate and instead writes a
 // protocol-violation error to the host's own service log - so we skip them to
 // stay quiet. A few (Redis 6379, MongoDB 27017) CAN be TLS-enabled on the same
 // port; we accept silently missing those rare cases (the network / filesystem
 // scans still surface the cert) rather than spam the common plaintext setup.
-// Implicit-TLS ports (DoT 853, LDAPS 636, SMTPS 465, IMAPS 993, POP3S 995,
-// RDP 3389) are kept - intentionally absent here.
+// Implicit-TLS ports (DoT 853, LDAPS 636, SMTPS 465, IMAPS 993, POP3S 995)
+// and supported STARTTLS/RDP ports are kept - intentionally absent here.
 var denyPorts = map[int]bool{
-	21:    true, // FTP
 	22:    true, // SSH
 	23:    true, // Telnet
-	25:    true, // SMTP (STARTTLS)
 	53:    true, // DNS (plaintext; systemd-resolved binds 127.0.0.53)
-	110:   true, // POP3 (STLS)
-	143:   true, // IMAP (STARTTLS)
-	389:   true, // LDAP (STARTTLS)
-	587:   true, // SMTP submission (STARTTLS)
 	3306:  true, // MySQL
 	5222:  true, // XMPP client
-	5432:  true, // PostgreSQL
 	6379:  true, // Redis (plaintext)
 	9092:  true, // Kafka (plaintext)
 	11211: true, // memcached

@@ -40,6 +40,17 @@ mount only the required CA/token files read-only, configure them as described in
 the Kubernetes guide and enable that scan type. Do not mount the Docker socket,
 the host root filesystem or use privileged mode.
 
+For an outbound proxy, put `HTTPS_PROXY` and `NO_PROXY` in the protected env
+file. Internal Kubernetes API names or addresses may need a `NO_PROXY` entry;
+TLS probes always connect directly. The container does not inherit the host's
+CA trust store. To trust an inspection proxy, add these options to `docker run`
+with a PEM CA bundle readable by UID 65532:
+
+```sh
+  --mount type=bind,src=/absolute/company-ca.pem,dst=/run/company-ca.pem,readonly \
+  --env SSL_CERT_FILE=/run/company-ca.pem
+```
+
 The container image includes OS packages and is not claimed to be reproducible.
 Pin base-image digests and review their updates before operating a registry
 distribution. The binary has the same reproducible build flags as native builds.

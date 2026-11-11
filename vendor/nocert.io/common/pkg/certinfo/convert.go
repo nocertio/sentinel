@@ -9,7 +9,6 @@ import (
 	"crypto/x509"
 	"encoding/asn1"
 	"fmt"
-	"net"
 	"strings"
 )
 
@@ -25,10 +24,7 @@ func FormatFingerprint(raw [32]byte) string {
 // MaxSANCount caps the number of SANs to prevent memory exhaustion.
 const MaxSANCount = 1000
 
-// MaxPolicyOIDs caps the number of certificate-policy OIDs we expose.
-// Real certs use <= 50; anything beyond 100 is junk or an OID-bomb attempt
-// (see CVE-2025-61729 / CVE-2026-32281 - quadratic policy-mapping work in
-// Go's crypto/x509 chain validation).
+// MaxPolicyOIDs caps the exported certificate-policy list.
 const MaxPolicyOIDs = 100
 
 // MaxExtKeyUsages caps the number of extended-key-usage entries we expose.
@@ -72,130 +68,6 @@ const MaxCRLDistributionPoints = 16
 // payload bounded.
 const MaxUnhandledCriticalExtensions = 16
 
-// CollectSANs merges all Subject Alternative Names into one sanitized,
-// MaxSANCount-capped list in stable order: DNS, IP, email, URI.
-func CollectSANs(cert *x509.Certificate) []string {
-	var sans []string
-	sans = append(sans, cert.DNSNames...)
-	for _, ip := range cert.IPAddresses {
-		sans = append(sans, ip.String())
-	}
-	sans = append(sans, cert.EmailAddresses...)
-	for _, u := range cert.URIs {
-		sans = append(sans, u.String())
-	}
-	if len(sans) > MaxSANCount {
-		sans = sans[:MaxSANCount]
-	}
-	return SanitizeFields(sans)
-}
-
-// collectIPAddressSANs returns the iPAddress Subject Alternative Names as
-// canonical strings. The IP subset is duplicated out of the mixed SANs field
-// on purpose: keeping it type-separate lets the UI flag IP SANs distinctly and
-// lets them be queried as Elasticsearch `ip` values (which the SAN strings
-// can't be).
-func collectIPAddressSANs(ips []net.IP) []string {
-	if len(ips) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(ips))
-	for _, ip := range ips {
-		if ip == nil {
-			continue
-		}
-		out = append(out, ip.String())
-		if len(out) >= MaxSANCount {
-			break
-		}
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return SanitizeFields(out)
-}
-
-// collectAIAURLs caps count + per-URL size and sanitizes control bytes
-// (Trojan Source / log injection defense - RFC 3986 forbids these bytes
-// in URIs anyway, so SanitizeField strips nothing legitimate).
-// Returns nil on nil/empty input so json:omitempty triggers.
-func collectAIAURLs(in []string) []string {
-	if len(in) == 0 {
-		return nil
-	}
-	if len(in) > MaxAIAURLCount {
-		in = in[:MaxAIAURLCount]
-	}
-	out := make([]string, len(in))
-	for i, u := range in {
-		out[i] = SanitizeField(truncateString(u, MaxAIAURLSize))
-	}
-	return out
-}
-
-// crlSchemes are the URI schemes we keep for CRL distribution points. CRLs
-// are published over HTTP(S) or LDAP; anything else (or a non-URL string) is
-// dropped as junk. Compared against the lowercased, sanitized value.
-var crlSchemes = []string{"http://", "https://", "ldap://"}
-
-// collectCRLDistributionPoints sanitizes and bounds the CRL distribution
-// point URIs, keeping only the crlSchemes. Mirrors collectAIAURLs (per-URL
-// truncation + control-byte sanitization) with an added scheme allow-list.
-// Returns nil on empty/all-dropped input so json:omitempty triggers.
-func collectCRLDistributionPoints(in []string) []string {
-	if len(in) == 0 {
-		return nil
-	}
-	var out []string
-	for _, u := range in {
-		clean := SanitizeField(truncateString(u, MaxAIAURLSize))
-		lower := strings.ToLower(clean)
-		ok := false
-		for _, s := range crlSchemes {
-			if strings.HasPrefix(lower, s) {
-				ok = true
-				break
-			}
-		}
-		if !ok {
-			continue
-		}
-		out = append(out, clean)
-		if len(out) >= MaxCRLDistributionPoints {
-			break
-		}
-	}
-	return out
-}
-
-// unknownExtKeyUsageOIDs returns the dotted-string OIDs of extended key usages
-// Go's crypto/x509 did not map to a known x509.ExtKeyUsage constant (they land
-// in cert.UnknownExtKeyUsage). extKeyUsageStrings only covers the known enum,
-// so these would otherwise be invisible. Deduped before truncation so repeated
-// OIDs cannot push distinct usages out of the capped display list.
-func unknownExtKeyUsageOIDs(cert *x509.Certificate) []string {
-	if len(cert.UnknownExtKeyUsage) == 0 {
-		return nil
-	}
-	out := make([]string, 0, min(len(cert.UnknownExtKeyUsage), MaxUnknownExtKeyUsageOIDs))
-	seen := make(map[string]struct{}, len(cert.UnknownExtKeyUsage))
-	for _, oid := range cert.UnknownExtKeyUsage {
-		dotted := oid.String()
-		if _, ok := seen[dotted]; ok {
-			continue
-		}
-		seen[dotted] = struct{}{}
-		out = append(out, dotted)
-		if len(out) == MaxUnknownExtKeyUsageOIDs {
-			break
-		}
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
-}
-
 var tlsFeatureOID = asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 1, 24}
 
 const tlsFeatureStatusRequest = 5
@@ -223,7 +95,9 @@ func hasOCSPMustStaple(cert *x509.Certificate) bool {
 	return false
 }
 
-// FromX509 converts a stdlib x509.Certificate to a CertificateInfo.
+// FromX509 converts a non-nil, parsed certificate to bounded metadata.
+// It does not validate trust. RawDER shares the certificate's backing bytes;
+// callers must treat them as immutable.
 func FromX509(cert *x509.Certificate) *CertificateInfo {
 	hash := sha256.Sum256(cert.Raw)
 
@@ -242,7 +116,7 @@ func FromX509(cert *x509.Certificate) *CertificateInfo {
 		NotAfter:                    cert.NotAfter,
 		KeyAlgorithm:                publicKeyAlgName(cert),
 		KeySize:                     publicKeySize(cert),
-		SignatureAlgorithm:          cert.SignatureAlgorithm.String(),
+		SignatureAlgorithm:          signatureAlgorithmName(cert.SignatureAlgorithm),
 		KeyUsages:                   keyUsageStrings(cert.KeyUsage),
 		ExtendedKeyUsages:           extKeyUsageStrings(cert.ExtKeyUsage),
 		PolicyOIDs:                  policyOIDStrings(cert),
@@ -350,8 +224,8 @@ func firstOrEmpty(s []string) string {
 }
 
 // dnHashHex returns the hex-encoded SHA-256 of the raw ASN.1 DN bytes.
-// Hashing the DER (not the RFC 2253 string) matches X509_NAME_cmp:
-// stringification is lossy across ASN.1 string types and attribute order.
+// This is a byte-level identity, not a normalized X.509 name comparison.
+// The display string can lose ASN.1 string-type and ordering information.
 //
 // Returns "" when rawDN is the empty SEQUENCE (`30 00`, 2 bytes) or
 // shorter - malformed/empty DNs would otherwise collide on a single
@@ -373,154 +247,6 @@ func formatHexColon(data []byte) string {
 		parts[i] = fmt.Sprintf("%02X", b)
 	}
 	return strings.Join(parts, ":")
-}
-
-func keyUsageStrings(ku x509.KeyUsage) []string {
-	var usages []string
-	mapping := []struct {
-		bit  x509.KeyUsage
-		name string
-	}{
-		{x509.KeyUsageDigitalSignature, "digital_signature"},
-		{x509.KeyUsageContentCommitment, "content_commitment"},
-		{x509.KeyUsageKeyEncipherment, "key_encipherment"},
-		{x509.KeyUsageDataEncipherment, "data_encipherment"},
-		{x509.KeyUsageKeyAgreement, "key_agreement"},
-		{x509.KeyUsageCertSign, "cert_sign"},
-		{x509.KeyUsageCRLSign, "crl_sign"},
-		{x509.KeyUsageEncipherOnly, "encipher_only"},
-		{x509.KeyUsageDecipherOnly, "decipher_only"},
-	}
-	for _, m := range mapping {
-		if ku&m.bit != 0 {
-			usages = append(usages, m.name)
-		}
-	}
-	return usages
-}
-
-func extKeyUsageStrings(ekus []x509.ExtKeyUsage) []string {
-	if len(ekus) == 0 {
-		return nil
-	}
-	// crypto/x509 appends EKUs in cert order without deduplicating, so a cert
-	// can repeat a usage arbitrarily. Dedup before the cap: otherwise a flood
-	// of duplicates could push a load-bearing usage (server_auth/client_auth/
-	// any) past MaxExtKeyUsages and out of the list the warning signals read
-	// from, silently suppressing eku_any / dual_eku_deprecated. The cap stays
-	// as a belt-and-suspenders bound on the deduped (already small) set.
-	seen := make(map[x509.ExtKeyUsage]struct{}, len(ekus))
-	deduped := make([]x509.ExtKeyUsage, 0, len(ekus))
-	for _, eku := range ekus {
-		if _, dup := seen[eku]; dup {
-			continue
-		}
-		seen[eku] = struct{}{}
-		deduped = append(deduped, eku)
-	}
-	ekus = deduped
-	if len(ekus) > MaxExtKeyUsages {
-		ekus = ekus[:MaxExtKeyUsages]
-	}
-	mapping := map[x509.ExtKeyUsage]string{
-		x509.ExtKeyUsageAny:                            "any",
-		x509.ExtKeyUsageServerAuth:                     "server_auth",
-		x509.ExtKeyUsageClientAuth:                     "client_auth",
-		x509.ExtKeyUsageCodeSigning:                    "code_signing",
-		x509.ExtKeyUsageEmailProtection:                "email_protection",
-		x509.ExtKeyUsageTimeStamping:                   "time_stamping",
-		x509.ExtKeyUsageOCSPSigning:                    "ocsp_signing",
-		x509.ExtKeyUsageMicrosoftServerGatedCrypto:     "ms_sgc",
-		x509.ExtKeyUsageNetscapeServerGatedCrypto:      "ns_sgc",
-		x509.ExtKeyUsageMicrosoftCommercialCodeSigning: "ms_code_signing",
-		x509.ExtKeyUsageMicrosoftKernelCodeSigning:     "ms_kernel_code_signing",
-	}
-	var usages []string
-	for _, eku := range ekus {
-		if name, ok := mapping[eku]; ok {
-			usages = append(usages, name)
-		} else {
-			usages = append(usages, fmt.Sprintf("unknown_%d", int(eku)))
-		}
-	}
-	return usages
-}
-
-// policyOIDStrings collects certificate-policy OIDs from both the modern
-// cert.Policies field (x509.OID, added in Go 1.22) and the legacy
-// PolicyIdentifiers field (asn1.ObjectIdentifier, deprecated).
-//
-// Reading only PolicyIdentifiers was a silent bug: since Go 1.24, policy
-// OIDs with arcs exceeding int32 are exposed ONLY via cert.Policies, and
-// such certs had their policy_oids field missing from /parse responses.
-// We read both, dedupe on string form, and preserve first-seen order.
-func policyOIDStrings(cert *x509.Certificate) []string {
-	total := len(cert.Policies) + len(cert.PolicyIdentifiers)
-	if total == 0 {
-		return nil
-	}
-	oids := make([]string, 0, total)
-	seen := make(map[string]struct{}, total)
-	add := func(s string) bool {
-		if _, dup := seen[s]; dup {
-			return true
-		}
-		seen[s] = struct{}{}
-		oids = append(oids, s)
-		return len(oids) < MaxPolicyOIDs
-	}
-	for _, oid := range cert.Policies {
-		if !add(oid.String()) {
-			return oids
-		}
-	}
-	for _, oid := range cert.PolicyIdentifiers {
-		if !add(oid.String()) {
-			return oids
-		}
-	}
-	return oids
-}
-
-// CA/Browser Forum reserved certificate-policy OIDs identifying a leaf's
-// validation tier (CABF Object Registry). Mandatory on publicly-trusted TLS
-// leaves since 2023-09-15 (ballot SC62v2); a well-formed leaf asserts exactly
-// one. EV lives on a separate arc from DV/OV/IV.
-const (
-	oidValidationEV = "2.23.140.1.1"
-	oidValidationDV = "2.23.140.1.2.1"
-	oidValidationOV = "2.23.140.1.2.2"
-	oidValidationIV = "2.23.140.1.2.3"
-)
-
-// validationLevel maps a leaf's reserved policy OID to "EV"/"OV"/"IV"/"DV".
-// Returns "" (Unknown) for CA/intermediate certs, certs with no reserved OID
-// (private CA, pre-2023 public), and the BR-forbidden case of two different
-// reserved tiers - absence is never inferred as DV, and we never guess.
-func validationLevel(cert *x509.Certificate) string {
-	if cert.IsCA {
-		return ""
-	}
-	levels := make(map[string]struct{}, 1)
-	for _, oid := range policyOIDStrings(cert) {
-		switch oid {
-		case oidValidationEV:
-			levels["EV"] = struct{}{}
-		case oidValidationOV:
-			levels["OV"] = struct{}{}
-		case oidValidationIV:
-			levels["IV"] = struct{}{}
-		case oidValidationDV:
-			levels["DV"] = struct{}{}
-		}
-	}
-	if len(levels) != 1 {
-		return ""
-	}
-	for l := range levels {
-		return l
-	}
-	return ""
 }
 
 // truncateString returns s if len(s) <= max, else s[:max]. A cut may split a

@@ -48,12 +48,12 @@ func countEmbeddedSCTs(cert *x509.Certificate) int {
 func parseSCTListCount(extValue []byte) int {
 	outer := cryptobyte.String(extValue)
 	var inner cryptobyte.String
-	if !outer.ReadASN1(&inner, asn1OctetStringTag) {
+	if !outer.ReadASN1(&inner, asn1OctetStringTag) || !outer.Empty() {
 		return 0
 	}
 
 	var sctList cryptobyte.String
-	if !inner.ReadUint16LengthPrefixed(&sctList) {
+	if !inner.ReadUint16LengthPrefixed(&sctList) || !inner.Empty() || sctList.Empty() {
 		return 0
 	}
 
@@ -63,11 +63,26 @@ func parseSCTListCount(extValue []byte) int {
 		if !sctList.ReadUint16LengthPrefixed(&sct) {
 			return 0
 		}
-		// A SerializedSCT always carries at least version+log_id+timestamp+
-		// signature (RFC 6962 §3.2), so a zero-length entry is malformed. Treat
-		// the whole list as malformed rather than letting empty entries pad the
-		// count toward the >=2 baseline.
-		if len(sct) == 0 {
+		var version uint8
+		if !sct.ReadUint8(&version) {
+			return 0
+		}
+		if version != 0 {
+			// Preserve forward compatibility without counting an unknown format
+			// as evidence of a structurally valid v1 SCT.
+			continue
+		}
+		var extensions, signature cryptobyte.String
+		var hash, algorithm uint8
+		if !sct.Skip(32+8) || // log ID and timestamp
+			!sct.ReadUint16LengthPrefixed(&extensions) ||
+			!sct.ReadUint8(&hash) || !sct.ReadUint8(&algorithm) ||
+			!sct.ReadUint16LengthPrefixed(&signature) || signature.Empty() || !sct.Empty() {
+			return 0
+		}
+		// RFC 5246 DigitallySigned: hash and signature codes must identify
+		// algorithms, not "none" / "anonymous". This is not signature verification.
+		if hash == 0 || hash > 6 || algorithm == 0 || algorithm > 3 {
 			return 0
 		}
 		count++

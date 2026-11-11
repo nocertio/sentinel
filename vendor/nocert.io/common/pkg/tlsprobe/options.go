@@ -11,14 +11,8 @@ const (
 	DefaultHandshakeTimeout = 5 * time.Second
 
 	MaxChainDepth = 10
-	// MaxCertSize is the per-certificate upper bound applied right after
-	// the TLS handshake. 64 KiB covers the corpus of real-world certs
-	// (peaks at 4.5 KiB) with ample headroom plus post-quantum sigs
-	// starting to appear in 2026 (ML-DSA-87 leaves ~12-14 KiB with SCTs,
-	// SLH-DSA-128f ~17 KiB), and accommodates enterprise weirdness (long
-	// policy/EKU/SAN trees). Must stay equal to the backend parser's max
-	// DER size and nocert-sentinel's MaxCertSize - drift means a
-	// probe ships a cert the parser refuses, or vice versa.
+	// MaxCertSize bounds each certificate after the handshake. Keep it aligned
+	// with the certparser and Sentinel DER limits, including post-quantum keys.
 	MaxCertSize = 65536 // 64 KiB
 )
 
@@ -29,6 +23,8 @@ type ContextDialer interface {
 }
 
 type Options struct {
+	// DisableALPN makes certificate discovery independent of HTTP negotiation.
+	DisableALPN      bool
 	ConnectTimeout   time.Duration
 	HandshakeTimeout time.Duration
 	ServerName       string // SNI override; defaults to host

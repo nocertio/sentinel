@@ -16,9 +16,9 @@ const (
 )
 
 // Protocol wire values (RFC 8446 §5.1, RFC 5246 §6.2.1, RFC 6101).
-// SSLv2's 0x0200 is display-only (nocert never speaks SSLv2).
+// 0x0200 remains a display alias for older stored SSLv2 observations.
 const (
-	wireSSL20 uint16 = 0x0200
+	wireSSL20 uint16 = 0x0002
 	wireSSL30 uint16 = 0x0300
 	wireTLS10 uint16 = 0x0301
 	wireTLS11 uint16 = 0x0302
@@ -28,6 +28,7 @@ const (
 
 var wireToCanonical = map[uint16]string{
 	wireSSL20: VersionSSL20,
+	0x0200:    VersionSSL20,
 	wireSSL30: VersionSSL30,
 	wireTLS10: VersionTLS10,
 	wireTLS11: VersionTLS11,
