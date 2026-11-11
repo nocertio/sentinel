@@ -34,6 +34,35 @@ var errTransient = errors.New("transient transport error")
 // poll loop uses it to tell an actionable failure from a passing blip.
 var ErrCredentialsRejected = errors.New("backend rejected the sentinel credentials")
 
+// HTTPError carries status and bounded retry guidance without reflecting a
+// proxy response body into retry logs.
+type HTTPError struct {
+	StatusCode int
+	RetryAfter time.Duration
+}
+
+func (e *HTTPError) Error() string {
+	return fmt.Sprintf("unexpected HTTP status %d", e.StatusCode)
+}
+
+// Retryable distinguishes temporary transport/status failures from invalid
+// payloads, rejected credentials and unverifiable signed responses.
+func Retryable(err error) bool {
+	if errors.Is(err, errTransient) {
+		return true
+	}
+	var status *HTTPError
+	return errors.As(err, &status) && (status.StatusCode == http.StatusTooManyRequests || status.StatusCode >= 500 && status.StatusCode <= 599)
+}
+
+func responseError(resp *http.Response) *HTTPError {
+	e := &HTTPError{StatusCode: resp.StatusCode}
+	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable {
+		e.RetryAfter = parseRetryAfter(resp.Header.Get("Retry-After"))
+	}
+	return e
+}
+
 // maxRejectionReasonBytes bounds how much of the rejection body we quote. A
 // non-2xx body is unverified and can come from anything on the path (proxy, WAF),
 // so it goes in an operator-facing log line as a short clue, never in full.
@@ -92,16 +121,17 @@ func noRedirect(*http.Request, []*http.Request) error { return http.ErrUseLastRe
 
 // Client is the signed HTTP transport for sentinel-server communication.
 type Client struct {
-	mu            sync.RWMutex
-	baseURL       string
-	sentinelID    string
-	keyID         string
-	privateKey    ed25519.PrivateKey
-	signingPubKey ed25519.PublicKey
-	signingKeyID  string
-	version       string
-	httpClient    *http.Client
-	logger        *slog.Logger
+	mu             sync.RWMutex
+	baseURL        string
+	sentinelID     string
+	keyID          string
+	privateKey     ed25519.PrivateKey
+	signingPubKey  ed25519.PublicKey
+	signingKeyID   string
+	version        string
+	retryNotBefore time.Time
+	httpClient     *http.Client
+	logger         *slog.Logger
 }
 
 func is2xx(status int) bool {
@@ -202,7 +232,7 @@ func (c *Client) GetTasks(ctx context.Context) (*TasksResponse, error) {
 		return nil, fmt.Errorf("%w (status %d): %s", ErrCredentialsRejected, resp.StatusCode, reason)
 	}
 	if !is2xx(resp.StatusCode) {
-		return nil, fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(body))
+		return nil, responseError(resp)
 	}
 
 	var tasks TasksResponse
@@ -232,7 +262,7 @@ func (c *Client) PostReport(ctx context.Context, report *ReportRequest) error {
 		}
 		retryAfter = 0
 
-		resp, body, err := c.doSigned(ctx, http.MethodPost, path, payload)
+		resp, _, err := c.doSigned(ctx, http.MethodPost, path, payload)
 		if err != nil {
 			// Retry only genuine network blips; a signing or response-verification
 			// failure is permanent (and re-delivering an unverifiable exchange is
@@ -246,26 +276,25 @@ func (c *Client) PostReport(ctx context.Context, report *ReportRequest) error {
 		if is2xx(resp.StatusCode) {
 			return nil
 		}
-		// A 4xx other than 429 is permanent (bad request, signature rejected):
-		// retrying won't help, so surface it immediately.
-		if resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
-			return fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(body))
+		statusErr := responseError(resp)
+		if !Retryable(statusErr) {
+			return statusErr
 		}
-		lastErr = fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(body))
-		if resp.StatusCode == http.StatusTooManyRequests {
-			retryAfter = parseRetryAfter(resp.Header.Get("Retry-After"))
-		}
+		lastErr = statusErr
+		retryAfter = statusErr.RetryAfter
 	}
 	return fmt.Errorf("report failed after %d attempts: %w", reportMaxAttempts, lastErr)
 }
 
 // retryDelay is the wait before the given attempt (attempt >= 1). It honors a
-// server Retry-After when present, else exponential backoff with equal jitter
-// ([backoff/2, backoff]) capped at reportRetryMaxDelay - the jitter spreads a
+// server Retry-After plus positive jitter when present, else exponential backoff
+// with equal jitter ([backoff/2, backoff]) capped at reportRetryMaxDelay. This spreads a
 // NAT-colocated fleet that all got 429'd at once instead of retrying in lockstep.
 func retryDelay(attempt int, retryAfter time.Duration) time.Duration {
 	if retryAfter > 0 {
-		return min(retryAfter, reportRetryMaxDelay)
+		retryAfter = min(retryAfter, time.Hour)
+		extra := min(retryAfter/10, time.Second)
+		return retryAfter + time.Duration(rand.Int64N(int64(extra)+1))
 	}
 	backoff := reportRetryBaseDelay << (attempt - 1)
 	if backoff > reportRetryMaxDelay || backoff <= 0 {
@@ -306,7 +335,7 @@ func parseRetryAfter(v string) time.Duration {
 		return time.Duration(secs) * time.Second
 	}
 	if t, err := http.ParseTime(v); err == nil {
-		if d := time.Until(t); d > 0 {
+		if d := time.Until(t); d > 0 && d <= time.Duration(maxHonoredRetryAfterSeconds)*time.Second {
 			return d
 		}
 	}
@@ -327,12 +356,15 @@ func (c *Client) RotateKey(ctx context.Context, newPubKeyB64 string) (*RotateRes
 		return nil, err
 	}
 	if !is2xx(resp.StatusCode) {
-		return nil, fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(body))
+		return nil, responseError(resp)
 	}
 
 	var result RotateResponse
 	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, fmt.Errorf("parsing rotate response: %w", err)
+		return nil, errors.New("invalid rotation response")
+	}
+	if result.KeyID == "" || !result.KeyExpiresAt.After(time.Now()) {
+		return nil, errors.New("invalid rotation response")
 	}
 	return &result, nil
 }
@@ -363,17 +395,17 @@ func Register(ctx context.Context, serverURL, token string, regReq RegisterReque
 	client := &http.Client{Timeout: httpClientTimeout, Transport: sharedTransport, CheckRedirect: noRedirect}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("sending register request: %w", err)
+		return nil, fmt.Errorf("sending register request: %w", errors.Join(errTransient, err))
 	}
 	defer func(body io.ReadCloser) { _ = body.Close() }(resp.Body)
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
-		return nil, fmt.Errorf("reading register response: %w", err)
+		return nil, fmt.Errorf("reading register response: %w", errors.Join(errTransient, err))
 	}
 
 	if !is2xx(resp.StatusCode) {
-		return nil, fmt.Errorf("registration failed (status %d): %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("registration failed: %w", responseError(resp))
 	}
 
 	var result RegisterResponse
@@ -385,8 +417,14 @@ func Register(ctx context.Context, serverURL, token string, regReq RegisterReque
 
 // doSigned signs (RFC 9421), sends the request and verifies the response
 // signature. A non-2xx response is UNVERIFIED: callers must act on the status
-// code alone, never on its body or headers.
+// code and bounded Retry-After only, never treat its contents as authenticated data.
 func (c *Client) doSigned(ctx context.Context, method, path string, body []byte) (*http.Response, []byte, error) {
+	// The cooldown also covers a new call after the last report attempt failed.
+	// Wait before signing, otherwise a long Retry-After could age the signature.
+	if err := c.waitForBackend(ctx); err != nil {
+		return nil, nil, err
+	}
+
 	c.mu.RLock()
 	baseURL := c.baseURL
 	keyID := c.keyID
@@ -409,6 +447,7 @@ func (c *Client) doSigned(ctx context.Context, method, path string, body []byte)
 		req.Header.Set("Content-Type", "application/json")
 	}
 
+	req.Header.Set("X-Sentinel-Features", "gentle-scan-v1")
 	if c.version != "" {
 		// Advisory, unsigned: lets the backend refresh this agent's stored
 		// version on the poll heartbeat (in-place upgrades never re-enroll).
@@ -448,8 +487,34 @@ func (c *Client) doSigned(ctx context.Context, method, path string, body []byte)
 		}
 	}
 
+	if delay := responseError(resp).RetryAfter; delay > 0 {
+		deadline := time.Now().Add(delay)
+		c.mu.Lock()
+		if deadline.After(c.retryNotBefore) {
+			c.retryNotBefore = deadline
+		}
+		c.mu.Unlock()
+	}
+
 	// Hand back a consumable body regardless of the path taken above.
 	resp.Body = io.NopCloser(bytes.NewReader(respBody))
 
 	return resp, respBody, nil
+}
+
+func (c *Client) waitForBackend(ctx context.Context) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		c.mu.RLock()
+		remaining := time.Until(c.retryNotBefore)
+		c.mu.RUnlock()
+		if remaining <= 0 {
+			return nil
+		}
+		if err := sleepCtx(ctx, remaining); err != nil {
+			return err
+		}
+	}
 }

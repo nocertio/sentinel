@@ -91,24 +91,38 @@ type ChainEntry struct {
 // on the backend, never trusted from an agent. The agent-input counterpart
 // (no IsWeak) is pkg/api/sentinel.CipherFinding.
 type CipherFinding struct {
-	Version string `json:"version"`
-	Cipher  string `json:"cipher"`
-	IsWeak  bool   `json:"is_weak"`
+	DHBits    uint16  `json:"dh_bits,omitempty"`
+	VersionID *uint16 `json:"version_id,omitempty"`
+	CipherID  *uint16 `json:"cipher_id,omitempty"`
+	Version   string  `json:"version"`
+	Cipher    string  `json:"cipher"`
+	IsWeak    bool    `json:"is_weak"`
 }
 
 // TLSObservation holds TLS connection metadata. JSON tags form a stable
 // contract consumed by downstream tooling.
 type TLSObservation struct {
-	HandshakeComplete  *bool           `json:"handshake_complete,omitempty"`
-	HSTSChecked        *bool           `json:"hsts_checked,omitempty"`
-	TLSVersion         string          `json:"tls_version"`
-	SupportedProtocols []string        `json:"supported_protocols,omitempty"`
-	CipherSuite        string          `json:"cipher_suite"`
-	NegotiatedGroup    string          `json:"negotiated_group,omitempty"`
-	OCSPStapling       bool            `json:"ocsp_stapling"`
-	HSTSEnabled        bool            `json:"hsts_enabled"`
-	HSTSMaxAge         int             `json:"hsts_max_age,omitempty"`
-	CipherEnumeration  []CipherFinding `json:"cipher_enumeration,omitempty"`
+	SNI                      string          `json:"sni,omitempty"`
+	CipherEnumerationSNI     *string         `json:"cipher_enumeration_sni,omitempty"`
+	LastCipherEnumAt         string          `json:"last_cipher_enum_at,omitempty"`
+	CollectionStatus         string          `json:"collection_status,omitempty"`
+	SupportedProtocolIDs     []uint16        `json:"supported_protocol_ids,omitempty"`
+	DHBits                   uint16          `json:"dh_bits,omitempty"`
+	SSL2CipherSpecs          []uint32        `json:"ssl2_cipher_specs,omitempty"`
+	TLSVersionID             *uint16         `json:"tls_version_id,omitempty"`
+	CipherSuiteID            *uint16         `json:"cipher_suite_id,omitempty"`
+	NegotiatedGroupID        *uint16         `json:"negotiated_group_id,omitempty"`
+	CipherEnumerationProfile string          `json:"cipher_enumeration_profile,omitempty"`
+	HandshakeComplete        *bool           `json:"handshake_complete,omitempty"`
+	HSTSChecked              *bool           `json:"hsts_checked,omitempty"`
+	TLSVersion               string          `json:"tls_version"`
+	SupportedProtocols       []string        `json:"supported_protocols,omitempty"`
+	CipherSuite              string          `json:"cipher_suite"`
+	NegotiatedGroup          string          `json:"negotiated_group,omitempty"`
+	OCSPStapling             bool            `json:"ocsp_stapling"`
+	HSTSEnabled              bool            `json:"hsts_enabled"`
+	HSTSMaxAge               int             `json:"hsts_max_age,omitempty"`
+	CipherEnumeration        []CipherFinding `json:"cipher_enumeration,omitempty"`
 }
 
 // Target represents an FQDN with ports to scan.

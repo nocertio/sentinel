@@ -1,11 +1,12 @@
 module nocert.io/sentinel
 
-go 1.27.2
+go 1.27.4
 
 require (
 	github.com/stretchr/testify v1.11.1
-	nocert.io/common v0.0.0
+	golang.org/x/net v0.52.0
 	gopkg.in/yaml.v3 v3.0.1
+	nocert.io/common v0.0.0
 )
 
 

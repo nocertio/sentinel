@@ -17,6 +17,7 @@ server_url: "https://sentinel.nocert.io"
 # allow_network_scan: true
 # allow_filesystem_scan: true
 # allow_local_scan: true
+# allow_dns_zone_transfer: true   # zone transfers (AXFR) of the zones set in NoCert
 
 # Logging.
 # log_level: info      # debug, info, warn, error

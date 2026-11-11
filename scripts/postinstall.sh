@@ -1,10 +1,12 @@
 #!/bin/sh
 set -e
 
-# postinst also fires on dpkg's abort-* recovery paths; only configure needs this.
-if [ "$1" != configure ]; then
-    exit 0
-fi
+# dpkg passes "configure" (and abort-* on recovery paths, which need nothing);
+# rpm passes the number of installed instances: 1 on install, 2 on upgrade.
+case "$1" in
+    configure | [0-9]*) ;;
+    *) exit 0 ;;
+esac
 
 if ! getent passwd nocert-sentinel >/dev/null 2>&1; then
     useradd --system --no-create-home --shell /usr/sbin/nologin nocert-sentinel

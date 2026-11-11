@@ -43,6 +43,10 @@ type Config struct {
 	// kill switch for the Kubernetes connector.
 	AllowKubernetesScan *bool `yaml:"allow_kubernetes_scan"`
 
+	// Set to false to forbid the sentinel from requesting any DNS zone
+	// transfer, even if the backend sends a dns_zone_transfer task.
+	AllowDNSZoneTransfer *bool `yaml:"allow_dns_zone_transfer"`
+
 	// KubernetesClusters lists the clusters the Kubernetes connector reads.
 	// Credentials stay in this local file (and the files it points to); they
 	// are never sent to the backend. Empty list = connector inert.
@@ -121,6 +125,10 @@ func (c *Config) applyDefaults() {
 	if c.AllowKubernetesScan == nil {
 		t := true
 		c.AllowKubernetesScan = &t
+	}
+	if c.AllowDNSZoneTransfer == nil {
+		t := true
+		c.AllowDNSZoneTransfer = &t
 	}
 	if c.KeyFile == "" {
 		// scripts/postinstall.sh mirrors this default to detect an enrolled host; keep in sync.

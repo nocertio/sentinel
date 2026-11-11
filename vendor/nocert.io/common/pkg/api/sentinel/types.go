@@ -70,7 +70,7 @@ type RotateResponse struct {
 
 // TaskResponse is one task pulled from the backend queue.
 // Type is an enum of known task types: "network_scan", "filesystem_scan",
-// "local_scan".
+// "local_scan", "kubernetes_scan", "dns_zone_transfer".
 //
 // Payload is the task-type-specific JSON. For network_scan it MAY contain
 // {"fqdn": string, "ports": [int], "targets": [TargetSpec]} (all optional -
@@ -111,6 +111,7 @@ type NetworkScanPayload struct {
 // Embedded in every TasksResponse so the sentinel always uses the freshest
 // settings.
 type SentinelConfig struct {
+	GentleScan                    bool     `json:"gentle_scan,omitempty"`
 	IPRanges                      []string `json:"ip_ranges"`
 	Ports                         []int    `json:"ports"`
 	ScanNetworkIntervalSeconds    int      `json:"scan_network_interval_seconds"`
@@ -147,7 +148,30 @@ const (
 	// objects), extract public certificate material only, and report
 	// kubernetes_observations. No payload.
 	TaskTypeKubernetesScan = "kubernetes_scan"
+	// TaskTypeDNSZoneTransfer asks the sentinel to report its host's resolver
+	// settings and to transfer (AXFR) each zone of DNSZoneTransferPayload,
+	// keeping only the names that point to one of its TLSAddresses.
+	TaskTypeDNSZoneTransfer = "dns_zone_transfer"
 )
+
+// DNSZone is one zone the operator asked a sentinel to read, and the DNS
+// server to transfer it from. Server is an IP literal; the port is 53.
+type DNSZone struct {
+	Name   string `json:"name"`
+	Server string `json:"server"`
+}
+
+// DNSZoneTransferPayload is carried in TaskResponse.Payload for a
+// dns_zone_transfer task. TLSAddresses are the IP addresses where the
+// organization already observed a TLS service: the sentinel reports only the
+// names whose A or AAAA record, directly or through CNAMEs inside the zone,
+// points to one of them, and drops the rest of the zone. The backend chooses
+// zones, servers and addresses; a host that does not trust it to do so
+// refuses the task with its local allow_dns_zone_transfer switch.
+type DNSZoneTransferPayload struct {
+	Zones        []DNSZone `json:"zones"`
+	TLSAddresses []string  `json:"tls_addresses"`
+}
 
 // ----------------------------------------------------------------------------
 // POST /api/v1/sentinels/{id}/report
@@ -171,8 +195,11 @@ type Certificate struct {
 // pkg/certinfo.CipherFinding - used after normalization, for storage and
 // API responses.
 type CipherFinding struct {
-	Version string `json:"version"` // canonical "TLSv1.0" / "TLSv1.1" / "TLSv1.2"
-	Cipher  string `json:"cipher"`  // IANA name
+	DHBits    uint16  `json:"dh_bits,omitempty"`
+	VersionID *uint16 `json:"version_id,omitempty"`
+	CipherID  *uint16 `json:"cipher_id,omitempty"`
+	Version   string  `json:"version"` // canonical "TLSv1.0" / "TLSv1.1" / "TLSv1.2"
+	Cipher    string  `json:"cipher"`  // IANA name
 }
 
 // TLSObservation carries TLS handshake metadata that the backend
@@ -180,21 +207,28 @@ type CipherFinding struct {
 // HSTS header, supported protocols, etc.). All fields are optional -
 // what's populated reflects what the scanner actually observed.
 type TLSObservation struct {
-	HandshakeComplete  *bool           `json:"handshake_complete,omitempty"`
-	HSTSChecked        *bool           `json:"hsts_checked,omitempty"`
-	TLSVersion         string          `json:"tls_version,omitempty"`
-	CipherSuite        string          `json:"cipher_suite,omitempty"`
-	NegotiatedGroup    string          `json:"negotiated_group,omitempty"`
-	OCSPStapling       bool            `json:"ocsp_stapling"`
-	HSTSEnabled        bool            `json:"hsts_enabled"`
-	HSTSMaxAge         int             `json:"hsts_max_age,omitempty"`
-	SupportedProtocols []string        `json:"supported_protocols,omitempty"`
-	CipherEnumeration  []CipherFinding `json:"cipher_enumeration,omitempty"`
+	SupportedProtocolIDs     []uint16        `json:"supported_protocol_ids,omitempty"`
+	DHBits                   uint16          `json:"dh_bits,omitempty"`
+	SSL2CipherSpecs          []uint32        `json:"ssl2_cipher_specs,omitempty"`
+	TLSVersionID             *uint16         `json:"tls_version_id,omitempty"`
+	CipherSuiteID            *uint16         `json:"cipher_suite_id,omitempty"`
+	NegotiatedGroupID        *uint16         `json:"negotiated_group_id,omitempty"`
+	CipherEnumerationProfile string          `json:"cipher_enumeration_profile,omitempty"`
+	HandshakeComplete        *bool           `json:"handshake_complete,omitempty"`
+	HSTSChecked              *bool           `json:"hsts_checked,omitempty"`
+	TLSVersion               string          `json:"tls_version,omitempty"`
+	CipherSuite              string          `json:"cipher_suite,omitempty"`
+	NegotiatedGroup          string          `json:"negotiated_group,omitempty"`
+	OCSPStapling             bool            `json:"ocsp_stapling"`
+	HSTSEnabled              bool            `json:"hsts_enabled"`
+	HSTSMaxAge               int             `json:"hsts_max_age,omitempty"`
+	SupportedProtocols       []string        `json:"supported_protocols,omitempty"`
+	CipherEnumeration        []CipherFinding `json:"cipher_enumeration,omitempty"`
 	// DeepEnumAttempted is set only when the deep enumeration pass completed
 	// cleanly; it distinguishes "no completed enum" from "completed but found
 	// no cipher" (e.g., a TLS-1.3-only server probed only across TLS
-	// 1.0/1.1/1.2). Interrupted or failed runs must leave it false and drop
-	// their partial findings.
+	// 1.0/1.1/1.2). Failed runs leave it false and set DeepEnumFailed;
+	// their partial positive findings do not establish completeness.
 	DeepEnumAttempted bool `json:"deep_enum_attempted,omitempty"`
 	DeepEnumFailed    bool `json:"deep_enum_failed,omitempty"`
 }
@@ -310,6 +344,39 @@ const (
 	KubernetesSourceKindConfigMap = "configmap"
 )
 
+// DNSResolver is what the sentinel host's resolver configuration lists. It is
+// read from a local file, without any DNS query, and lets the backend suggest
+// zones to read.
+type DNSResolver struct {
+	Servers       []string `json:"servers"`
+	SearchDomains []string `json:"search_domains"`
+}
+
+// DNSZoneResult is the outcome of one zone transfer. Hostnames holds only the
+// names kept by the TLSAddresses filter. SourceAddress is the sentinel's own
+// address on the connection to Server: the address the DNS server must allow.
+type DNSZoneResult struct {
+	Name          string   `json:"name"`
+	Server        string   `json:"server"`
+	Status        string   `json:"status"`
+	Records       int      `json:"records"`
+	Hostnames     []string `json:"hostnames,omitempty"`
+	SourceAddress string   `json:"source_address,omitempty"`
+}
+
+// Values for DNSZoneResult.Status.
+const (
+	DNSZoneStatusOK = "ok"
+	// DNSZoneStatusRefused: the server answered REFUSED, NOTAUTH or NOTIMP.
+	DNSZoneStatusRefused = "refused"
+	// DNSZoneStatusUnreachable: no TCP connection, or no answer in time.
+	DNSZoneStatusUnreachable = "unreachable"
+	// DNSZoneStatusTooLarge: a size cap was reached; what was read is reported.
+	DNSZoneStatusTooLarge = "too_large"
+	// DNSZoneStatusFailed: the answer was unreadable or incomplete.
+	DNSZoneStatusFailed = "failed"
+)
+
 // ReportRequest is the payload pushed by the sentinel after a task
 // completes. Status is "partial" (more to come), "completed", or
 // "failed". Certificates are deduplicated within the request by
@@ -369,6 +436,14 @@ type ReportRequest struct {
 	// tells "a k8s sweep ran (against N configured clusters)" apart from any
 	// other bare report, which drives the per-sentinel cluster status.
 	KubernetesClustersConfigured *int `json:"kubernetes_clusters_configured,omitempty"`
+
+	// DNSResolver is non-nil ONLY on the final "completed" report of a
+	// dns_zone_transfer task, including when no zone is configured. It tells
+	// the backend that DNSZones is the complete outcome of that task.
+	DNSResolver *DNSResolver `json:"dns_resolver,omitempty"`
+
+	// DNSZones carries one result per zone of the dns_zone_transfer task.
+	DNSZones []DNSZoneResult `json:"dns_zones,omitempty"`
 }
 
 // Report statuses.

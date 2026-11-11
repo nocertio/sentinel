@@ -6,7 +6,7 @@ reporting route in [SECURITY.md](SECURITY.md) for vulnerabilities.
 
 ## Development
 
-Install Go 1.27.2, clone this repository and work on a branch. All required
+Install Go 1.27.4, clone this repository and work on a branch. All required
 dependency sources are included; no private repository access is needed.
 
 ```sh

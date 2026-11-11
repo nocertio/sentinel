@@ -1,9 +1,6 @@
 // Package httpsig implements the exact subset of RFC 9421 HTTP Message
 // Signatures that the NoCert backend and its agents speak: Ed25519 over a fixed
-// set of covered components, with an RFC 9530 Content-Digest. It exists so the
-// platform depends on the standard library alone for this path instead of a
-// JOSE stack - the covered-component set is frozen by the wire contract, so a
-// focused implementation is auditable end to end.
+// set of covered components, with an RFC 9530 Content-Digest.
 //
 // Requests cover ("@method" "@target-uri" "@authority" "content-digest") with
 // params created, nonce, alg, keyid. Responses cover ("@status" "content-digest")
@@ -63,6 +60,9 @@ func GenerateNonce() (string, error) {
 // the fixed request components with priv under keyID and a freshly generated
 // nonce. body is the exact bytes the request will send.
 func SignRequest(req *http.Request, body []byte, priv ed25519.PrivateKey, keyID string) error {
+	if len(priv) != ed25519.PrivateKeySize {
+		return fmt.Errorf("invalid private key length")
+	}
 	nonce, err := GenerateNonce()
 	if err != nil {
 		return err
@@ -82,8 +82,9 @@ func SignRequest(req *http.Request, body []byte, priv ed25519.PrivateKey, keyID 
 
 // VerifyRequest checks the RFC 9421 signature on req against pub, requiring the
 // keyid inside Signature-Input to equal keyID. It verifies only the signature -
-// timestamp skew and nonce replay are the caller's responsibility. scheme may be
-// nil; when set it supplies the @target-uri scheme for a proxied request.
+// body-to-digest matching, timestamp skew and nonce replay are the caller's
+// responsibility. scheme may be nil; when set it supplies the @target-uri
+// scheme for a proxied request.
 func VerifyRequest(req *http.Request, pub ed25519.PublicKey, keyID string, scheme SchemeResolver) error {
 	// ed25519.Verify panics on a wrong-length key; return an error instead so a
 	// caller that forgets to validate the key gets a rejection, not a crash.
@@ -97,7 +98,7 @@ func VerifyRequest(req *http.Request, pub ed25519.PublicKey, keyID string, schem
 	if sig.keyID != keyID {
 		return fmt.Errorf("keyid mismatch")
 	}
-	if err := sig.checkComponents(RequestComponents); err != nil {
+	if err := sig.checkProfile(RequestComponents); err != nil {
 		return err
 	}
 	schemeOverride := ""
@@ -132,6 +133,7 @@ func SignResponse(statusCode int, body []byte, requestNonce string, priv ed25519
 // VerifyResponse checks the signature on resp against pub, requiring the keyid to
 // equal keyID and the tag parameter to equal requestNonce (binding the response
 // to the request that produced requestNonce).
+// The caller must also compare Content-Digest with the received body.
 func VerifyResponse(resp *http.Response, requestNonce string, pub ed25519.PublicKey, keyID string) error {
 	if len(pub) != ed25519.PublicKeySize {
 		return fmt.Errorf("invalid public key length")
@@ -146,7 +148,7 @@ func VerifyResponse(resp *http.Response, requestNonce string, pub ed25519.Public
 	if sig.tag != requestNonce {
 		return fmt.Errorf("response tag does not match request nonce")
 	}
-	if err := sig.checkComponents(ResponseComponents); err != nil {
+	if err := sig.checkProfile(ResponseComponents); err != nil {
 		return err
 	}
 	digest := resp.Header.Get("Content-Digest")
@@ -261,7 +263,7 @@ func setSignature(h http.Header, priv ed25519.PrivateKey, base, params string) {
 
 type parsedSignature struct {
 	components []string
-	params     string // verbatim ";..." + inner list, as re-serialized for the base
+	params     string // inner list and parameters as received
 	keyID      string
 	created    int64
 	nonce      string
@@ -270,7 +272,10 @@ type parsedSignature struct {
 	signature  []byte
 }
 
-func (s *parsedSignature) checkComponents(want []string) error {
+func (s *parsedSignature) checkProfile(want []string) error {
+	if s.alg != algEd25519 {
+		return fmt.Errorf("unsupported signature algorithm")
+	}
 	if len(s.components) != len(want) {
 		return fmt.Errorf("unexpected covered components")
 	}
@@ -283,9 +288,8 @@ func (s *parsedSignature) checkComponents(want []string) error {
 }
 
 // parseSignature reads the Signature-Input and Signature headers under Label and
-// returns the covered components, the raw params (re-serialized so the verifier
-// reconstructs the exact base the signer used), the individual parameters, and
-// the decoded signature bytes.
+// returns the covered components, raw parameters used in the signature base,
+// individual parameter values, and decoded signature bytes.
 func parseSignature(h http.Header) (*parsedSignature, error) {
 	rawInput := h.Get("Signature-Input")
 	if rawInput == "" {
@@ -333,10 +337,10 @@ func parseSignature(h http.Header) (*parsedSignature, error) {
 	if err != nil {
 		return nil, fmt.Errorf("signature header: %w", err)
 	}
-	enc := strings.TrimPrefix(strings.TrimSuffix(sigValue, ":"), ":")
-	if enc == sigValue {
+	if len(sigValue) < 2 || sigValue[0] != ':' || sigValue[len(sigValue)-1] != ':' {
 		return nil, fmt.Errorf("signature is not a byte-sequence")
 	}
+	enc := sigValue[1 : len(sigValue)-1]
 	s.signature, err = base64.StdEncoding.DecodeString(enc)
 	if err != nil {
 		return nil, fmt.Errorf("signature base64: %w", err)
@@ -345,7 +349,7 @@ func parseSignature(h http.Header) (*parsedSignature, error) {
 }
 
 // dictValue returns the value of the given key from an RFC 8941 dictionary
-// header, requiring exactly the one entry we produce (no other members).
+// header. The profile places its single member first, without leading whitespace.
 func dictValue(header, key string) (string, error) {
 	prefix := key + "="
 	if !strings.HasPrefix(header, prefix) {
@@ -354,8 +358,8 @@ func dictValue(header, key string) (string, error) {
 	return header[len(prefix):], nil
 }
 
-// splitParams splits a leading ";k=v;k=v..." string into its k=v members,
-// respecting quoted-string values (which never contain ';' here).
+// splitParams splits the profile's ";k=v;k=v..." representation.
+// Profile values do not contain semicolons; this is not a general SF parser.
 func splitParams(s string) []string {
 	var out []string
 	for _, p := range strings.Split(s, ";") {

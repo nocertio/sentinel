@@ -9,13 +9,23 @@ It collects certificates from:
 - **Network endpoints:** TLS connections to the IP ranges and ports you configure.
 - **Linux hosts:** local listeners and certificate files the service can read.
 - **Kubernetes:** certificate fields in supported Secrets and ConfigMaps.
+- **Internal DNS zones:** zone transfers (AXFR) of the zones you add in NoCert,
+  to probe by name the hosts that already serve TLS.
 
 Sentinel requires a NoCert account. Scan jobs come from NoCert; there is no
 standalone scan command. It does not issue or renew certificates.
 
 ## Install
 
-Packages are available for **Debian and Ubuntu, amd64 and arm64**, with systemd.
+Signed Debian packages and binary archives for **Linux amd64 and arm64** are
+available in [GitHub Releases](https://github.com/nocertio/sentinel/releases).
+See [release verification](docs/releases.md) before installing a downloaded package.
+The Debian package requires systemd.
+
+The APT repository below supports Debian and Ubuntu. Repository updates and
+GitHub releases are published separately, so their latest versions may differ.
+
+### Debian and Ubuntu
 
 Add the repository signing key:
 
@@ -46,6 +56,8 @@ sudo apt update
 sudo apt install nocert-sentinel
 ```
 
+### Enroll
+
 In NoCert, open **Sentinels > Deploy Sentinel** to get an enrollment token.
 Create `/etc/nocert-sentinel/enroll.env` as root with mode `0600`, containing:
 
@@ -65,6 +77,13 @@ The host will appear in your Sentinel inventory. See the
 and token handling. Avoid passing the token on the command line, where it can
 appear in process arguments.
 
+For VM templates, install the package without enrolling. Stop the service and
+run `sudo nocert-sentinel --check-image` before capturing the image. The check
+refuses existing credentials and enrollment tokens without deleting them. Use
+`--config` for a custom configuration. Inject the token on each clone, then start
+the service. Each clone creates its own key; the machine-ID check cannot detect
+a copy that retains both the ID and the key.
+
 ## Configure collection
 
 Configuration lives in `/etc/nocert-sentinel/config.yaml`. Each scan type can be
@@ -76,6 +95,7 @@ allow_network_scan: true
 allow_filesystem_scan: true
 allow_local_scan: true
 allow_kubernetes_scan: false
+allow_dns_zone_transfer: true
 log_level: info
 ```
 
@@ -98,8 +118,14 @@ Environment="NO_PROXY=localhost,127.0.0.1"
 ```
 
 Restart the service to apply it. A proxy that intercepts HTTPS needs its CA in
-the host trust store. Proxy settings apply to the connection to NoCert; TLS
-probes connect directly to scan targets. APT has its own proxy configuration.
+the host trust store. HTTP CONNECT and Basic proxy authentication are supported;
+NTLM and Kerberos/Negotiate are not. For Basic authentication, put the proxy URL
+with URL-encoded credentials in a root-owned environment file (mode 0600) loaded
+with systemd's `EnvironmentFile`.
+
+Backend and Kubernetes API requests use these proxy settings. Add internal
+Kubernetes API names or addresses to `NO_PROXY` if they need direct access.
+TLS probes connect directly to scan targets. APT has its own proxy settings.
 
 ## Data and permissions
 
@@ -113,19 +139,19 @@ cannot grant access to just its certificate fields. See
 [data collection and security](docs/data-collection.md) for the fields reported
 and how connections are authenticated.
 
-The Debian service runs as an unprivileged user with systemd restrictions. It
+The packaged service runs as an unprivileged user with systemd restrictions. It
 needs outbound access to NoCert and the scan targets, with no inbound listener.
 Filesystem discovery is limited to files that this service user can read.
 
 ## Build from source
 
-Use Go **1.27.2**. Dependencies are included in `vendor/`; building this checkout
+Use Go **1.27.4**. Dependencies are included in `vendor/`; building this checkout
 does not require access to another repository.
 
 ```sh
-GOTOOLCHAIN=go1.27.2 go test -mod=vendor -race ./...
-GOTOOLCHAIN=go1.27.2 go vet -mod=vendor ./...
-GOTOOLCHAIN=go1.27.2 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+GOTOOLCHAIN=go1.27.4 go test -mod=vendor -race ./...
+GOTOOLCHAIN=go1.27.4 go vet -mod=vendor ./...
+GOTOOLCHAIN=go1.27.4 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
   go build -mod=vendor -trimpath -buildvcs=false \
   -ldflags '-s -w -X nocert.io/sentinel/internal/version.Version=VERSION' \
   -o nocert-sentinel ./cmd/nocert-sentinel
@@ -150,3 +176,5 @@ privately. Keep credentials and customer inventories out of issues.
 
 Sentinel is licensed under [Apache-2.0](LICENSE). The vendored shared library
 uses MIT; dependency notices are in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).
+
+Protocol and collection limits: [TLS discovery coverage](docs/tls-coverage.md).

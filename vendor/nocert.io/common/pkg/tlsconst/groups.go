@@ -1,55 +1,56 @@
 package tlsconst
 
-import "crypto/tls"
+import (
+	"crypto/tls"
+	"fmt"
+)
 
-// GroupString returns a stable, lowercase, dash-free string representation
-// of a TLS 1.3 named group. Empty string on unknown / RSA key exchange
-// (state.CurveID == 0 in crypto/tls).
-//
-// Naming follows the IANA registry "Description" column lowercased, with
-// dashes removed: "X25519MLKEM768" -> "x25519mlkem768". The string form is
-// consumed by Elasticsearch keyword fields, frontend display, and the
-// IsPostQuantumGroup classifier.
-func GroupString(id tls.CurveID) string {
-	switch id {
-	case tls.X25519:
-		return "x25519"
-	case tls.CurveP256:
-		return "secp256r1"
-	case tls.CurveP384:
-		return "secp384r1"
-	case tls.CurveP521:
-		return "secp521r1"
-	case tls.X25519MLKEM768:
-		return "x25519mlkem768"
-	case tls.SecP256r1MLKEM768:
-		return "secp256r1mlkem768"
-	case tls.SecP384r1MLKEM1024:
-		return "secp384r1mlkem1024"
-	}
-	return ""
+// namedGroups keeps wire identity, stable labels and classification together.
+var namedGroups = [...]struct {
+	id          tls.CurveID
+	name        string
+	postQuantum bool
+}{
+	{tls.CurveP256, "secp256r1", false},
+	{tls.CurveP384, "secp384r1", false},
+	{tls.CurveP521, "secp521r1", false},
+	{tls.X25519, "x25519", false},
+	{514, "mlkem1024", true},
+	{tls.SecP256r1MLKEM768, "secp256r1mlkem768", true},
+	{tls.X25519MLKEM768, "x25519mlkem768", true},
+	{tls.SecP384r1MLKEM1024, "secp384r1mlkem1024", true},
 }
 
-// IsPostQuantumGroup returns true if name is a hybrid post-quantum named
-// group as exposed by Go 1.26 crypto/tls. Match exact (no substring).
-// Extend manually as new hybrids land.
+// GroupString returns the local label for a TLS named group. Zero means no
+// observed group; unknown IDs retain their wire value as Unknown(0xNNNN).
+func GroupString(id tls.CurveID) string {
+	for _, group := range namedGroups {
+		if group.id == id {
+			return group.name
+		}
+	}
+	if id == 0 {
+		return ""
+	}
+	return fmt.Sprintf("Unknown(0x%04X)", uint16(id))
+}
+
+// IsPostQuantumGroup recognizes the catalogue's hybrid and standalone ML-KEM groups.
 func IsPostQuantumGroup(name string) bool {
-	switch name {
-	case "x25519mlkem768", "secp256r1mlkem768", "secp384r1mlkem1024":
-		return true
+	for _, group := range namedGroups {
+		if group.name == name {
+			return group.postQuantum
+		}
 	}
 	return false
 }
 
-// IsKnownGroupString returns true if name is one of the canonical strings
-// produced by GroupString. Used by ingesters as a whitelist filter on a
-// negotiated_group string sent by an agent (defends against a compromised
-// agent injecting arbitrary strings into Elasticsearch).
+// IsKnownGroupString reports whether name is a canonical label in the catalogue.
 func IsKnownGroupString(name string) bool {
-	switch name {
-	case "x25519", "secp256r1", "secp384r1", "secp521r1",
-		"x25519mlkem768", "secp256r1mlkem768", "secp384r1mlkem1024":
-		return true
+	for _, group := range namedGroups {
+		if group.name == name {
+			return true
+		}
 	}
 	return false
 }
