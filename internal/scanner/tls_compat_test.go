@@ -10,11 +10,54 @@ import (
 	"math/big"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"nocert.io/sentinel/internal/testutil"
 )
+
+func TestSharedCertificatePreservesSNIKeyExchanges(t *testing.T) {
+	cert := testutil.Certificate(t, func(c *x509.Certificate) { c.DNSNames = []string{"a.example", "b.example"} })
+	var connections atomic.Int32
+	listener, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+			group := tls.X25519
+			if hello.ServerName == "a.example" {
+				group = tls.X25519MLKEM768
+			}
+			return &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS13, CurvePreferences: []tls.CurveID{group}}, nil
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			connections.Add(1)
+			_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+			_ = conn.(*tls.Conn).Handshake()
+			_ = conn.Close()
+		}
+	}()
+	scanner := New(slog.Default())
+	result, err := scanner.Scan(t.Context(), ScanConfig{IPRanges: []string{"127.0.0.1/32"}, Ports: []int{listener.Addr().(*net.TCPAddr).Port}, Timeout: time.Second})
+	require.NoError(t, err)
+	require.Len(t, result.Certificates, 1)
+	require.Len(t, result.NetworkObservations, 3)
+	require.Equal(t, int32(3), connections.Load(), "one default probe and the existing two SNI probes")
+	groups := map[string]string{}
+	for _, obs := range result.NetworkObservations {
+		require.NotNil(t, obs.TLS.HandshakeComplete)
+		require.True(t, *obs.TLS.HandshakeComplete)
+		groups[obs.SNI] = obs.TLS.NegotiatedGroup
+	}
+	require.Equal(t, map[string]string{"": "x25519", "a.example": "x25519mlkem768", "b.example": "x25519"}, groups)
+}
 
 func TestInventoryTLSCompatibility(t *testing.T) {
 	_, _, ca, key := generateTestCA()

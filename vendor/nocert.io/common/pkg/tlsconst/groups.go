@@ -5,20 +5,30 @@ import (
 	"fmt"
 )
 
+// GroupKind distinguishes classical, hybrid and standalone post-quantum groups.
+type GroupKind uint8
+
+const (
+	GroupUnknown GroupKind = iota
+	GroupClassical
+	GroupHybrid
+	GroupPostQuantum
+)
+
 // namedGroups keeps wire identity, stable labels and classification together.
 var namedGroups = [...]struct {
-	id          tls.CurveID
-	name        string
-	postQuantum bool
+	id   tls.CurveID
+	name string
+	kind GroupKind
 }{
-	{tls.CurveP256, "secp256r1", false},
-	{tls.CurveP384, "secp384r1", false},
-	{tls.CurveP521, "secp521r1", false},
-	{tls.X25519, "x25519", false},
-	{514, "mlkem1024", true},
-	{tls.SecP256r1MLKEM768, "secp256r1mlkem768", true},
-	{tls.X25519MLKEM768, "x25519mlkem768", true},
-	{tls.SecP384r1MLKEM1024, "secp384r1mlkem1024", true},
+	{tls.CurveP256, "secp256r1", GroupClassical},
+	{tls.CurveP384, "secp384r1", GroupClassical},
+	{tls.CurveP521, "secp521r1", GroupClassical},
+	{tls.X25519, "x25519", GroupClassical},
+	{514, "mlkem1024", GroupPostQuantum},
+	{tls.SecP256r1MLKEM768, "secp256r1mlkem768", GroupHybrid},
+	{tls.X25519MLKEM768, "x25519mlkem768", GroupHybrid},
+	{tls.SecP384r1MLKEM1024, "secp384r1mlkem1024", GroupHybrid},
 }
 
 // GroupString returns the local label for a TLS named group. Zero means no
@@ -37,12 +47,18 @@ func GroupString(id tls.CurveID) string {
 
 // IsPostQuantumGroup recognizes the catalogue's hybrid and standalone ML-KEM groups.
 func IsPostQuantumGroup(name string) bool {
+	kind := ClassifyGroup(name)
+	return kind == GroupHybrid || kind == GroupPostQuantum
+}
+
+// ClassifyGroup classifies a canonical label. Unrecognized groups stay unknown.
+func ClassifyGroup(name string) GroupKind {
 	for _, group := range namedGroups {
 		if group.name == name {
-			return group.postQuantum
+			return group.kind
 		}
 	}
-	return false
+	return GroupUnknown
 }
 
 // IsKnownGroupString reports whether name is a canonical label in the catalogue.

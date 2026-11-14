@@ -341,9 +341,7 @@ func (s *Scanner) probeTarget(ctx context.Context, tgt target, cfg ScanConfig, r
 	// SNI re-probing
 	if !cfg.SkipSNIReprobe && len(probeResult.PeerCerts) > 0 {
 		leaf := probeResult.PeerCerts[0]
-		seen := map[string]bool{
-			resultFingerprint(probeResult): true,
-		}
+		seen := map[string]bool{strings.ToLower(out.SNI): true}
 		reprobes := 0
 
 		reprobeWith := func(sni string) {
@@ -351,21 +349,14 @@ func (s *Scanner) probeTarget(ctx context.Context, tgt target, cfg ScanConfig, r
 			if err != nil {
 				return
 			}
-			if seen[resultFingerprint(sniResult)] {
-				return
-			}
-			seen[resultFingerprint(sniResult)] = true
-
-			// Do NOT inherit the primary SNI's enumeration. This reprobe selected a
-			// DIFFERENT certificate, which can be a different vhost with a different
-			// TLS policy (per-server_name ssl_ciphers/ssl_protocols), so the primary's
-			// cipher findings may not characterise this endpoint. Emit with no enum
-			// evidence (nil/false); the backend's targeted per-(host,port,SNI) DeepEnum
-			// fills it in authoritatively. A brief gap beats attributing wrong evidence.
+			// Virtual hosts may share a certificate but use different TLS settings.
+			// Keep their measurements; the report builder deduplicates the DER.
+			// Enumeration belongs only to the primary probe's SNI.
 			sd := s.probeResultToOutput(tgt.port, sni, sniResult, nil, false)
-			if sd == nil {
+			if sd == nil || seen[strings.ToLower(sd.SNI)] {
 				return
 			}
+			seen[strings.ToLower(sd.SNI)] = true
 			select {
 			case resultCh <- *sd:
 			case <-ctx.Done():
