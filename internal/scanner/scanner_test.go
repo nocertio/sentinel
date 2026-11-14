@@ -200,7 +200,7 @@ func TestScanLocalTLSServer(t *testing.T) {
 	assert.False(t, result.StartedAt.IsZero())
 	assert.False(t, result.CompletedAt.IsZero())
 
-	require.Len(t, result.NetworkObservations, 1)
+	require.Len(t, result.NetworkObservations, 2)
 	obs := result.NetworkObservations[0]
 	assert.Equal(t, host, obs.IP)
 	assert.Equal(t, port, obs.Port)
@@ -480,7 +480,7 @@ func TestScanLocalTLSServer_FieldsComplete(t *testing.T) {
 		Timeout:  5 * time.Second,
 	})
 	require.NoError(t, err)
-	require.Len(t, result.NetworkObservations, 1)
+	require.Len(t, result.NetworkObservations, 2)
 
 	obs := result.NetworkObservations[0]
 	assert.NotEmpty(t, obs.ObservedChainFingerprints)
@@ -518,7 +518,7 @@ func TestSNIReprobing(t *testing.T) {
 				TLS:         &certinfo.TLSObservation{TLSVersion: "TLSv1.3"},
 				PeerCerts:   []*x509.Certificate{defaultCert},
 			},
-			// Re-probe with "default.example.com" returns same cert (deduplicated)
+			// Re-probe with "default.example.com" returns same cert, distinct TLS observation
 			"10.0.0.1:443:default.example.com": {
 				Certificate: certinfo.FromX509(defaultCert),
 				Chain:       nil,
@@ -543,15 +543,15 @@ func TestSNIReprobing(t *testing.T) {
 	})
 
 	require.NoError(t, err)
-	require.Len(t, result.NetworkObservations, 2)
+	require.Len(t, result.NetworkObservations, 3)
 
 	// First observation is the default (no SNI)
 	assert.Equal(t, "", result.NetworkObservations[0].SNI)
 	assert.Equal(t, "10.0.0.1", result.NetworkObservations[0].IP)
 
-	// Second observation found via SNI re-probe
-	assert.Equal(t, "other.example.com", result.NetworkObservations[1].SNI)
-	assert.Equal(t, "10.0.0.1", result.NetworkObservations[1].IP)
+	// Both named services remain represented, including the shared certificate.
+	assert.Equal(t, "other.example.com", result.NetworkObservations[2].SNI)
+	assert.Equal(t, "10.0.0.1", result.NetworkObservations[2].IP)
 
 	// Two distinct fingerprints across the two certs
 	require.Len(t, result.Certificates, 2)
@@ -701,14 +701,15 @@ func TestSNIReprobing_WildcardSkipped(t *testing.T) {
 	})
 
 	require.NoError(t, err)
-	// Only 1 observation - all re-probes return same fingerprint (sentinel
-	// scanner deduplicates by fingerprint at the SNI level).
-	assert.Len(t, result.NetworkObservations, 1)
+	require.Len(t, result.NetworkObservations, 3)
+	for _, obs := range result.NetworkObservations {
+		require.NotContains(t, obs.SNI, "*")
+	}
 	// And only 1 unique cert in the dedup'd list.
 	assert.Len(t, result.Certificates, 1)
 }
 
-func TestSNIReprobing_DeduplicatesFingerprints(t *testing.T) {
+func TestSNIReprobing_PreservesNamesAndDeduplicatesCertificates(t *testing.T) {
 	cert := generateTestCertWithSANs(t, "a.example.com", []string{"b.example.com", "c.example.com"})
 	mock := &sniMockProber{
 		results: map[string]*tlsprobe.Result{
@@ -739,7 +740,7 @@ func TestSNIReprobing_DeduplicatesFingerprints(t *testing.T) {
 	})
 
 	require.NoError(t, err)
-	assert.Len(t, result.NetworkObservations, 1, "same fingerprint on all SANs should not produce duplicates")
+	assert.Len(t, result.NetworkObservations, 4, "different names retain their own observations")
 	assert.Len(t, result.Certificates, 1)
 }
 

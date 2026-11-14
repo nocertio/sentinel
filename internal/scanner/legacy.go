@@ -80,13 +80,3 @@ func (d *peerDialer) DialContextWithTimeout(ctx context.Context, network, addr s
 	}
 	return conn, err
 }
-
-func resultFingerprint(r *tlsprobe.Result) string {
-	if len(r.RawChain) > 0 {
-		return Fingerprint(r.RawChain[0])
-	}
-	if r.Certificate != nil {
-		return r.Certificate.Fingerprint
-	}
-	return ""
-}
